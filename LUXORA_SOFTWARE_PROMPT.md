@@ -24,7 +24,7 @@ sellers, and other businesses (B2B) in the UAE and abroad.
 - **Registration authority:** Sharjah Media City Free Zone Authority (SHAMS)
 - **Formation number:** 2541889 | **Licence number:** 2541889.01
 - **Licence issued:** 28 October 2025 | **Licence expiry:** 27 October 2026
-- **Manager:** Althaf Najeeb
+- **Manager:** Althaf Najeeb, the company's Manager as named on the SHAMS licence. He is the main decision-maker, authorised signatory, and final approver for business, finance, and advertising decisions.
 - **Registered address:** Shams Business Center, Sharjah Media City Free Zone, Al Messaned, Sharjah, UAE (Flexi Desk)
 - **Business address:** 44-12 Al Daghaya Street, Al Daghaya, Deira, Dubai, UAE
 - **Phone:** +971 55 389 4353
@@ -65,7 +65,7 @@ Use the following unless you have a strong reason to change it, and explain any 
 
 | Role | Access |
 |---|---|
-| Super Admin (Manager – Althaf Najeeb) | Everything, including settings, finance, and approvals |
+| Super Admin / Manager (Althaf Najeeb) | Everything: settings, users, finance, pricing, and all final approvals |
 | Sales Executive | Customers, quotations, sales orders, own commissions |
 | Warehouse / Logistics | Stock, receiving, picking, packing, dispatch |
 | Accountant | Invoices, payments, VAT reports, expenses |
@@ -73,6 +73,21 @@ Use the following unless you have a strong reason to change it, and explain any 
 | Ad Client (external) | Their own campaigns, reports, and invoices only |
 | B2B Customer (external) | Portal: catalogue, wholesale prices, orders, statements |
 | Retail Customer (external) | Storefront account, orders, wishlist |
+
+### Manager's Role in the Software (Althaf Najeeb)
+- **Owner of the system:** the only Super Admin by default; creates users, assigns roles, and can switch off any user's access
+- **Final approver for:**
+  - discounts below the minimum selling price and changes to customer credit limits
+  - purchase orders above a set amount (configurable, e.g. AED 20,000)
+  - new price lists and wholesale price-tier changes
+  - write-offs, stock adjustments, and credit notes
+  - every advertising campaign and ad creative before it goes live (8A and 8C)
+  - client advertising proposals, contracts, and media budgets (8B)
+  - influencer deals and payments
+- **Authorised signatory:** his name, title "Manager", and digital signature/stamp appear on tax invoices, quotations, client advertising contracts, and monthly agency reports
+- **Manager Dashboard:** a one-screen daily view with sales, profit, cash position, receivables, stock value, ad spend vs. ROAS, items waiting for his approval, and licence and document expiry alerts
+- **Mobile approvals:** approve or reject requests from his phone, with push, email, and WhatsApp notifications
+- **Delegation:** he can hand approval rights to another user for a set period (e.g. while travelling), with every action recorded in the audit log
 
 ## MODULES & FEATURES
 
