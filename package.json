@@ -1,0 +1,10 @@
+{
+  "name": "luxora-hub",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "db:validate": "pnpm --filter @luxora/db validate",
+    "db:generate": "pnpm --filter @luxora/db generate",
+    "db:migrate": "pnpm --filter @luxora/db migrate"
+  }
+}

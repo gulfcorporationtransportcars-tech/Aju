@@ -1,0 +1,3119 @@
+// =============================================================================
+// LUXORA Hub: database schema
+// LUXORA Perfume & Cosmetics Trading LLC
+//
+// Conventions
+// - Money: Decimal(14, 2), stored in the document currency, with an AED value
+//   where reports need it. Exchange rates: Decimal(14, 6).
+// - Quantities: Int (perfume is sold in whole units).
+// - Stock movements and journal entries are append-only: never edited, only
+//   reversed with a new row.
+// - Bilingual text uses paired fields: nameEn / nameAr.
+// - Every table has createdAt/updatedAt; important tables also track createdById.
+// =============================================================================
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// =============================================================================
+// 1. CORE: users, roles, approvals, audit, settings, notifications
+// =============================================================================
+
+enum UserType {
+  STAFF
+  B2B_CUSTOMER
+  AD_CLIENT
+  RETAIL_CUSTOMER
+}
+
+enum UserStatus {
+  ACTIVE
+  INVITED
+  SUSPENDED
+}
+
+enum Locale {
+  EN
+  AR
+}
+
+model User {
+  id           String     @id @default(cuid())
+  type         UserType
+  status       UserStatus @default(ACTIVE)
+  email        String     @unique
+  phone        String?    @unique
+  passwordHash String?
+  fullName     String
+  title        String? // e.g. "Manager" (printed on documents for signatories)
+  locale       Locale     @default(EN)
+  roleId       String?
+  isSignatory  Boolean    @default(false) // name + signature printed on invoices, contracts
+  signatureUrl String?
+  lastLoginAt  DateTime?
+  createdAt    DateTime   @default(now())
+  updatedAt    DateTime   @updatedAt
+
+  role Role? @relation(fields: [roleId], references: [id])
+
+  // Links for outside users: each outside user belongs to exactly one record
+  customerId     String?
+  customer       Customer?       @relation("CustomerPortalUsers", fields: [customerId], references: [id])
+  adClientId     String?
+  adClient       AdClient?       @relation("AdClientPortalUsers", fields: [adClientId], references: [id])
+  retailCustomer RetailCustomer?
+  employee       Employee?
+
+  sessions              Session[]
+  approvalsRequested    ApprovalRequest[]    @relation("ApprovalRequester")
+  approvalsAssigned     ApprovalRequest[]    @relation("ApprovalAssignee")
+  approvalsDecided      ApprovalRequest[]    @relation("ApprovalDecider")
+  delegationsGiven      ApprovalDelegation[] @relation("DelegationFrom")
+  delegationsReceived   ApprovalDelegation[] @relation("DelegationTo")
+  auditLogs             AuditLog[]
+  notifications         Notification[]
+  customersManaged      Customer[]           @relation("CustomerSalesperson")
+  leadsOwned            Lead[]               @relation("LeadOwner")
+  quotationsCreated     Quotation[]          @relation("QuotationCreatedBy")
+  salesOrdersCreated    SalesOrder[]         @relation("SalesOrderCreatedBy")
+  salesOrdersAsSalesRep SalesOrder[]         @relation("SalesOrderSalesperson")
+  activities            Activity[]
+  commissions           Commission[]
+  stockMovements        StockMovement[]
+  purchaseOrdersCreated PurchaseOrder[]
+  expensesCreated       Expense[]
+  journalEntriesCreated JournalEntry[]
+  campaignsOwned        Campaign[]           @relation("CampaignOwner")
+  creativesCreated      AdCreative[]         @relation("CreativeCreatedBy")
+  creativeApprovals     CreativeApproval[]
+  complianceChecksDone  ComplianceCheck[]
+  tasksAssigned         Task[]               @relation("TaskAssignee")
+  tasksCreated          Task[]               @relation("TaskCreator")
+  timeEntries           TimeEntry[]
+  documentsUploaded     Document[]
+  stockTakesCounted     StockTake[]
+  reviews               ProductReview[]
+  broadcastsCreated     Broadcast[]
+  landingPagesCreated   LandingPage[]
+
+  @@index([type, status])
+}
+
+model Session {
+  id               String    @id @default(cuid())
+  userId           String
+  refreshTokenHash String    @unique
+  userAgent        String?
+  ipAddress        String?
+  expiresAt        DateTime
+  revokedAt        DateTime?
+  createdAt        DateTime  @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+}
+
+model Role {
+  id          String   @id @default(cuid())
+  key         String   @unique // SUPER_ADMIN, SALES, WAREHOUSE, ACCOUNTANT, MARKETING, AD_CLIENT, B2B_CUSTOMER, RETAIL_CUSTOMER
+  name        String
+  description String?
+  isSystem    Boolean  @default(false) // system roles cannot be deleted
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  users       User[]
+  permissions RolePermission[]
+}
+
+model Permission {
+  id          String  @id @default(cuid())
+  key         String  @unique // "module:action", e.g. "sales_order:create", "campaign:approve", "*"
+  module      String
+  description String?
+
+  roles RolePermission[]
+}
+
+model RolePermission {
+  roleId       String
+  permissionId String
+
+  role       Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+  permission Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+}
+
+enum ApprovalType {
+  DISCOUNT_BELOW_MIN
+  CREDIT_LIMIT_CHANGE
+  PO_ABOVE_LIMIT
+  PRICE_LIST_CHANGE
+  STOCK_WRITE_OFF
+  CREDIT_NOTE
+  CAMPAIGN_GO_LIVE
+  CREATIVE_PUBLISH
+  AGENCY_PROPOSAL
+  MEDIA_BUDGET
+  INFLUENCER_DEAL
+}
+
+enum ApprovalStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  CANCELLED
+}
+
+// Who approves each approval type (default: the Manager), and above what amount
+model ApprovalRule {
+  id              String       @id @default(cuid())
+  type            ApprovalType @unique
+  approverRoleKey String       @default("SUPER_ADMIN")
+  thresholdAed    Decimal?     @db.Decimal(14, 2) // e.g. POs above AED 20,000
+  isActive        Boolean      @default(true)
+  updatedAt       DateTime     @updatedAt
+}
+
+// One approval inbox for everything. entityType + entityId point at the record
+// being approved (e.g. "Campaign", "ckx123...").
+model ApprovalRequest {
+  id            String         @id @default(cuid())
+  type          ApprovalType
+  status        ApprovalStatus @default(PENDING)
+  entityType    String
+  entityId      String
+  title         String
+  details       Json? // snapshot of what is being approved (amounts, discount %, etc.)
+  amountAed     Decimal?       @db.Decimal(14, 2)
+  requestedById String
+  assignedToId  String
+  decidedById   String?
+  decisionNote  String?
+  decidedAt     DateTime?
+  createdAt     DateTime       @default(now())
+  updatedAt     DateTime       @updatedAt
+
+  requestedBy User  @relation("ApprovalRequester", fields: [requestedById], references: [id])
+  assignedTo  User  @relation("ApprovalAssignee", fields: [assignedToId], references: [id])
+  decidedBy   User? @relation("ApprovalDecider", fields: [decidedById], references: [id])
+
+  @@index([assignedToId, status])
+  @@index([entityType, entityId])
+}
+
+// The Manager hands approval rights to another user for a set period
+model ApprovalDelegation {
+  id         String         @id @default(cuid())
+  fromUserId String
+  toUserId   String
+  types      ApprovalType[] // empty = all types
+  startsAt   DateTime
+  endsAt     DateTime
+  reason     String?
+  revokedAt  DateTime?
+  createdAt  DateTime       @default(now())
+
+  fromUser User @relation("DelegationFrom", fields: [fromUserId], references: [id])
+  toUser   User @relation("DelegationTo", fields: [toUserId], references: [id])
+
+  @@index([fromUserId, startsAt, endsAt])
+}
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String?
+  action     String // CREATE, UPDATE, DELETE, APPROVE, REJECT, LOGIN, EXPORT...
+  entityType String
+  entityId   String?
+  before     Json?
+  after      Json?
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+
+  user User? @relation(fields: [userId], references: [id])
+
+  @@index([entityType, entityId])
+  @@index([userId, createdAt])
+}
+
+enum NotificationChannel {
+  IN_APP
+  EMAIL
+  WHATSAPP
+  SMS
+  PUSH
+}
+
+model Notification {
+  id        String              @id @default(cuid())
+  userId    String
+  channel   NotificationChannel
+  title     String
+  body      String
+  link      String?
+  readAt    DateTime?
+  sentAt    DateTime?
+  createdAt DateTime            @default(now())
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId, readAt])
+}
+
+// Key/value settings: company profile, numbering formats, integrations, theme...
+model Setting {
+  key       String   @id // e.g. "company.profile", "numbering.invoice", "vat.trn"
+  value     Json
+  updatedAt DateTime @updatedAt
+}
+
+// Document number sequences: LUX-INV-2026-0001, LUX-QT-2026-0001...
+model NumberSequence {
+  id      String @id @default(cuid())
+  docType String // INV, QT, SO, DN, PO, GRN, CN, PAY, EXP, JE, CMP, AGC...
+  year    Int
+  prefix  String @default("LUX")
+  next    Int    @default(1)
+  padding Int    @default(4)
+
+  @@unique([docType, year])
+}
+
+model Currency {
+  code      String   @id // AED, USD, EUR, SAR, GBP...
+  name      String
+  symbol    String
+  isBase    Boolean  @default(false)
+  isActive  Boolean  @default(true)
+  updatedAt DateTime @updatedAt
+
+  rates ExchangeRate[]
+}
+
+model ExchangeRate {
+  id           String   @id @default(cuid())
+  currencyCode String
+  rateToAed    Decimal  @db.Decimal(14, 6) // 1 unit of currency = X AED
+  effectiveOn  DateTime @db.Date
+  source       String? // manual, central bank, API
+  createdAt    DateTime @default(now())
+
+  currency Currency @relation(fields: [currencyCode], references: [code])
+
+  @@unique([currencyCode, effectiveOn])
+}
+
+model Country {
+  code   String  @id // ISO 3166-1 alpha-2: AE, SA, GB, FR...
+  nameEn String
+  nameAr String?
+  isGcc  Boolean @default(false)
+
+  brands        Brand[]
+  customers     Customer[]
+  suppliers     Supplier[]
+  productOrigin ProductVariant[]
+  batchOrigin   Batch[]
+}
+
+// =============================================================================
+// 2. CATALOGUE: brands, products, variants, prices
+// =============================================================================
+
+enum BrandCategory {
+  DESIGNER
+  NICHE
+}
+
+enum Gender {
+  MEN
+  WOMEN
+  UNISEX
+}
+
+enum Concentration {
+  PARFUM
+  EXTRAIT
+  EDP
+  EDT
+  EDC
+  BODY_MIST
+  OIL
+  OTHER
+}
+
+enum ProductKind {
+  FRAGRANCE
+  COSMETIC
+  SKINCARE
+  SOAP
+  ACCESSORY
+  GIFT_SET
+  WATCH
+  JEWELLERY
+}
+
+enum PackType {
+  RETAIL_BOX
+  TESTER
+  MINIATURE
+  SAMPLE
+  UNBOXED
+  GIFT_SET
+}
+
+model Brand {
+  id                String        @id @default(cuid())
+  name              String        @unique
+  slug              String        @unique
+  category          BrandCategory
+  originCountryCode String?
+  logoUrl           String?
+  descriptionEn     String?
+  descriptionAr     String?
+  website           String?
+  isActive          Boolean       @default(true)
+  // Advertising compliance: may LUXORA use this brand's logo/trademark in ads?
+  adLogoPermission  Boolean       @default(false)
+  adPermissionNote  String?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+
+  originCountry Country?        @relation(fields: [originCountryCode], references: [code])
+  products      Product[]
+  campaigns     CampaignBrand[]
+}
+
+model FragranceFamily {
+  id     String  @id @default(cuid())
+  nameEn String  @unique // Oriental, Woody, Floral, Fresh, Gourmand, Citrus, Aromatic, Chypre, Leather...
+  nameAr String?
+
+  products Product[]
+}
+
+model Note {
+  id     String  @id @default(cuid())
+  nameEn String  @unique // Oud, Rose, Bergamot, Vanilla, Amber, Musk...
+  nameAr String?
+
+  products ProductNote[]
+}
+
+enum NoteLayer {
+  TOP
+  HEART
+  BASE
+}
+
+model Product {
+  id                String         @id @default(cuid())
+  brandId           String
+  kind              ProductKind    @default(FRAGRANCE)
+  nameEn            String
+  nameAr            String?
+  slug              String         @unique
+  gender            Gender?
+  concentration     Concentration?
+  fragranceFamilyId String?
+  descriptionEn     String?
+  descriptionAr     String?
+  launchYear        Int?
+  perfumer          String?
+  isActive          Boolean        @default(true)
+  isPublishedOnline Boolean        @default(false) // visible on retail storefront
+  isPublishedB2b    Boolean        @default(true) // visible on B2B portal
+  seoTitleEn        String?
+  seoTitleAr        String?
+  seoDescriptionEn  String?
+  seoDescriptionAr  String?
+  createdAt         DateTime       @default(now())
+  updatedAt         DateTime       @updatedAt
+
+  brand           Brand             @relation(fields: [brandId], references: [id])
+  fragranceFamily FragranceFamily?  @relation(fields: [fragranceFamilyId], references: [id])
+  variants        ProductVariant[]
+  notes           ProductNote[]
+  images          ProductImage[]
+  reviews         ProductReview[]
+  campaigns       CampaignProduct[]
+
+  @@index([brandId])
+  @@index([kind, isActive])
+}
+
+model ProductNote {
+  productId String
+  noteId    String
+  layer     NoteLayer
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  note    Note    @relation(fields: [noteId], references: [id])
+
+  @@id([productId, noteId, layer])
+}
+
+model ProductImage {
+  id        String   @id @default(cuid())
+  productId String
+  url       String
+  altEn     String?
+  altAr     String?
+  sortOrder Int      @default(0)
+  createdAt DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+
+  @@index([productId])
+}
+
+// The sellable item: one product in one size and pack type (e.g. Layton EDP 125ml Tester)
+model ProductVariant {
+  id                String   @id @default(cuid())
+  productId         String
+  sku               String   @unique
+  barcode           String?  @unique // EAN / UPC
+  sizeMl            Int?
+  packType          PackType @default(RETAIL_BOX)
+  isSealed          Boolean  @default(true)
+  hsCode            String? // customs tariff code for export (e.g. 3303.00)
+  weightGrams       Int?
+  originCountryCode String?
+  reorderLevel      Int      @default(0)
+  reorderQty        Int      @default(0)
+  isActive          Boolean  @default(true)
+
+  // Prices in AED (customer-specific prices live in PriceListItem)
+  costAed            Decimal  @default(0) @db.Decimal(14, 2) // weighted average landed cost (kept up to date by inventory)
+  wholesaleAAed      Decimal  @default(0) @db.Decimal(14, 2) // tier A: best wholesale price
+  wholesaleBAed      Decimal  @default(0) @db.Decimal(14, 2)
+  wholesaleCAed      Decimal  @default(0) @db.Decimal(14, 2)
+  exportPriceUsd     Decimal  @default(0) @db.Decimal(14, 2)
+  retailPriceAed     Decimal  @default(0) @db.Decimal(14, 2) // storefront price, VAT inclusive
+  compareAtPriceAed  Decimal? @db.Decimal(14, 2) // "was" price on storefront
+  minSellingPriceAed Decimal  @default(0) @db.Decimal(14, 2) // below this needs Manager approval
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  product            Product             @relation(fields: [productId], references: [id], onDelete: Cascade)
+  originCountry      Country?            @relation(fields: [originCountryCode], references: [code])
+  batches            Batch[]
+  stockLevels        StockLevel[]
+  stockMovements     StockMovement[]
+  stockTakeLines     StockTakeLine[]
+  priceListItems     PriceListItem[]
+  priceHistory       PriceHistory[]
+  supplierPrices     SupplierPrice[]
+  purchaseOrderLines PurchaseOrderLine[]
+  grnLines           GoodsReceiptLine[]
+  quotationLines     QuotationLine[]
+  salesOrderLines    SalesOrderLine[]
+  deliveryNoteLines  DeliveryNoteLine[]
+  invoiceLines       InvoiceLine[]
+  creditNoteLines    CreditNoteLine[]
+  cartItems          CartItem[]
+  wishlistItems      WishlistItem[]
+  promotionItems     PromotionItem[]
+  influencerGifts    InfluencerGift[]
+
+  @@index([productId])
+}
+
+enum PriceTier {
+  A
+  B
+  C
+  EXPORT
+  RETAIL
+  CUSTOM
+}
+
+// Price lists per tier or per customer. Changes go through PRICE_LIST_CHANGE approval.
+model PriceList {
+  id           String    @id @default(cuid())
+  name         String
+  tier         PriceTier
+  currencyCode String    @default("AED")
+  validFrom    DateTime?
+  validTo      DateTime?
+  isActive     Boolean   @default(true)
+  isApproved   Boolean   @default(false)
+  createdAt    DateTime  @default(now())
+  updatedAt    DateTime  @updatedAt
+
+  items     PriceListItem[]
+  customers Customer[]
+}
+
+model PriceListItem {
+  id          String  @id @default(cuid())
+  priceListId String
+  variantId   String
+  price       Decimal @db.Decimal(14, 2)
+  minQty      Int     @default(1) // volume breaks: 1+, 12+, 48+
+
+  priceList PriceList      @relation(fields: [priceListId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@unique([priceListId, variantId, minQty])
+}
+
+model PriceHistory {
+  id        String   @id @default(cuid())
+  variantId String
+  field     String // costAed, wholesaleAAed, retailPriceAed...
+  oldValue  Decimal  @db.Decimal(14, 2)
+  newValue  Decimal  @db.Decimal(14, 2)
+  changedBy String?
+  createdAt DateTime @default(now())
+
+  variant ProductVariant @relation(fields: [variantId], references: [id], onDelete: Cascade)
+
+  @@index([variantId, createdAt])
+}
+
+// =============================================================================
+// 3. INVENTORY: warehouses, batches, stock levels, stock movements, stock-take
+// =============================================================================
+
+enum WarehouseType {
+  OWN
+  THIRD_PARTY
+  IN_TRANSIT
+  SHOWROOM
+}
+
+model Warehouse {
+  id        String        @id @default(cuid())
+  code      String        @unique // DXB-DEIRA, TRANSIT...
+  name      String
+  type      WarehouseType @default(OWN)
+  address   String?
+  emirate   String?
+  isActive  Boolean       @default(true)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  stockLevels   StockLevel[]
+  movements     StockMovement[]
+  goodsReceipts GoodsReceipt[]
+  deliveryNotes DeliveryNote[]
+  stockTakes    StockTake[]
+  salesOrders   SalesOrder[]
+}
+
+// A lot of stock bought together: carries authenticity proof and expiry
+model Batch {
+  id                   String    @id @default(cuid())
+  variantId            String
+  batchNo              String // manufacturer lot code
+  manufacturedOn       DateTime? @db.Date
+  expiresOn            DateTime? @db.Date
+  originCountryCode    String?
+  supplierId           String?
+  goodsReceiptId       String?
+  unitCostAed          Decimal   @db.Decimal(14, 2) // landed cost per unit
+  // Authenticity: supplier invoice / proof of purchase (stored as Documents)
+  authenticityVerified Boolean   @default(false)
+  createdAt            DateTime  @default(now())
+
+  variant       ProductVariant     @relation(fields: [variantId], references: [id])
+  originCountry Country?           @relation(fields: [originCountryCode], references: [code])
+  supplier      Supplier?          @relation(fields: [supplierId], references: [id])
+  goodsReceipt  GoodsReceipt?      @relation(fields: [goodsReceiptId], references: [id])
+  stockLevels   StockLevel[]
+  movements     StockMovement[]
+  deliveryLines DeliveryNoteLine[]
+  documents     Document[]
+
+  @@unique([variantId, batchNo])
+  @@index([expiresOn])
+}
+
+// Current quantity per variant + warehouse + batch (fast reads). Kept in sync with StockMovement.
+model StockLevel {
+  id          String @id @default(cuid())
+  variantId   String
+  warehouseId String
+  batchId     String
+  onHand      Int    @default(0)
+  reserved    Int    @default(0) // held by confirmed orders (wholesale, B2B, web) not yet delivered
+
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+  warehouse Warehouse      @relation(fields: [warehouseId], references: [id])
+  batch     Batch          @relation(fields: [batchId], references: [id])
+
+  @@unique([variantId, warehouseId, batchId])
+  @@index([warehouseId])
+}
+
+enum StockMovementType {
+  PURCHASE_RECEIPT
+  SALE_DELIVERY
+  WEB_ORDER_DELIVERY
+  CUSTOMER_RETURN
+  SUPPLIER_RETURN
+  TRANSFER_OUT
+  TRANSFER_IN
+  ADJUSTMENT_PLUS
+  ADJUSTMENT_MINUS
+  DAMAGE
+  SAMPLE
+  TESTER_USE
+  INFLUENCER_GIFT
+  STOCK_TAKE
+  OPENING
+}
+
+// Append-only ledger of every stock change
+model StockMovement {
+  id           String            @id @default(cuid())
+  type         StockMovementType
+  variantId    String
+  warehouseId  String
+  batchId      String?
+  quantity     Int // positive = in, negative = out
+  unitCostAed  Decimal           @db.Decimal(14, 2)
+  reason       String?
+  // Source document (e.g. "DeliveryNote", id) so every movement traces back
+  refType      String?
+  refId        String?
+  reversalOfId String?           @unique
+  createdById  String?
+  createdAt    DateTime          @default(now())
+
+  variant    ProductVariant @relation(fields: [variantId], references: [id])
+  warehouse  Warehouse      @relation(fields: [warehouseId], references: [id])
+  batch      Batch?         @relation(fields: [batchId], references: [id])
+  createdBy  User?          @relation(fields: [createdById], references: [id])
+  reversalOf StockMovement? @relation("MovementReversal", fields: [reversalOfId], references: [id])
+  reversedBy StockMovement? @relation("MovementReversal")
+
+  @@index([variantId, createdAt])
+  @@index([refType, refId])
+}
+
+enum StockTakeStatus {
+  DRAFT
+  COUNTING
+  SUBMITTED
+  APPROVED
+  CANCELLED
+}
+
+model StockTake {
+  id          String          @id @default(cuid())
+  number      String          @unique
+  warehouseId String
+  status      StockTakeStatus @default(DRAFT)
+  countedById String?
+  notes       String?
+  startedAt   DateTime        @default(now())
+  completedAt DateTime?
+
+  warehouse Warehouse       @relation(fields: [warehouseId], references: [id])
+  countedBy User?           @relation(fields: [countedById], references: [id])
+  lines     StockTakeLine[]
+}
+
+model StockTakeLine {
+  id          String  @id @default(cuid())
+  stockTakeId String
+  variantId   String
+  batchNo     String?
+  systemQty   Int
+  countedQty  Int?
+
+  stockTake StockTake      @relation(fields: [stockTakeId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+// =============================================================================
+// 4. PURCHASING: suppliers, purchase orders, goods receipts, landed cost
+// =============================================================================
+
+model Supplier {
+  id               String   @id @default(cuid())
+  code             String   @unique
+  name             String
+  countryCode      String?
+  contactName      String?
+  email            String?
+  phone            String?
+  whatsapp         String?
+  address          String?
+  trn              String? // UAE VAT number if local
+  currencyCode     String   @default("AED")
+  paymentTermsDays Int      @default(0)
+  notes            String?
+  isActive         Boolean  @default(true)
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  country        Country?        @relation(fields: [countryCode], references: [code])
+  prices         SupplierPrice[]
+  purchaseOrders PurchaseOrder[]
+  goodsReceipts  GoodsReceipt[]
+  supplierBills  SupplierBill[]
+  payments       Payment[]
+  batches        Batch[]
+  documents      Document[]
+}
+
+model SupplierPrice {
+  id           String   @id @default(cuid())
+  supplierId   String
+  variantId    String
+  price        Decimal  @db.Decimal(14, 2)
+  currencyCode String   @default("AED")
+  quotedOn     DateTime @default(now())
+
+  supplier Supplier       @relation(fields: [supplierId], references: [id], onDelete: Cascade)
+  variant  ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@index([variantId, quotedOn])
+}
+
+enum PurchaseOrderStatus {
+  DRAFT
+  PENDING_APPROVAL
+  APPROVED
+  SENT
+  PARTIALLY_RECEIVED
+  RECEIVED
+  CLOSED
+  CANCELLED
+}
+
+model PurchaseOrder {
+  id           String              @id @default(cuid())
+  number       String              @unique // LUX-PO-2026-0001
+  supplierId   String
+  status       PurchaseOrderStatus @default(DRAFT)
+  orderDate    DateTime            @default(now())
+  expectedOn   DateTime?
+  currencyCode String              @default("AED")
+  exchangeRate Decimal             @default(1) @db.Decimal(14, 6)
+  subtotal     Decimal             @default(0) @db.Decimal(14, 2)
+  vatAmount    Decimal             @default(0) @db.Decimal(14, 2)
+  total        Decimal             @default(0) @db.Decimal(14, 2)
+  totalAed     Decimal             @default(0) @db.Decimal(14, 2)
+  notes        String?
+  createdById  String?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  supplier      Supplier            @relation(fields: [supplierId], references: [id])
+  createdBy     User?               @relation(fields: [createdById], references: [id])
+  lines         PurchaseOrderLine[]
+  goodsReceipts GoodsReceipt[]
+  supplierBills SupplierBill[]
+}
+
+model PurchaseOrderLine {
+  id              String  @id @default(cuid())
+  purchaseOrderId String
+  variantId       String
+  quantity        Int
+  receivedQty     Int     @default(0)
+  unitPrice       Decimal @db.Decimal(14, 2)
+  vatRate         Decimal @default(0) @db.Decimal(5, 2)
+  lineTotal       Decimal @db.Decimal(14, 2)
+
+  purchaseOrder PurchaseOrder  @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+  variant       ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+model GoodsReceipt {
+  id                String   @id @default(cuid())
+  number            String   @unique // LUX-GRN-2026-0001
+  purchaseOrderId   String?
+  supplierId        String
+  warehouseId       String
+  receivedOn        DateTime @default(now())
+  notes             String?
+  isLandedCostFinal Boolean  @default(false)
+  createdAt         DateTime @default(now())
+
+  purchaseOrder PurchaseOrder?     @relation(fields: [purchaseOrderId], references: [id])
+  supplier      Supplier           @relation(fields: [supplierId], references: [id])
+  warehouse     Warehouse          @relation(fields: [warehouseId], references: [id])
+  lines         GoodsReceiptLine[]
+  landedCosts   LandedCost[]
+  batches       Batch[]
+}
+
+model GoodsReceiptLine {
+  id             String    @id @default(cuid())
+  goodsReceiptId String
+  variantId      String
+  batchNo        String
+  expiresOn      DateTime? @db.Date
+  quantity       Int
+  unitPriceAed   Decimal   @db.Decimal(14, 2) // purchase price converted to AED
+  landedUnitCost Decimal   @db.Decimal(14, 2) // purchase price + share of landed costs
+
+  goodsReceipt GoodsReceipt   @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+  variant      ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+enum LandedCostType {
+  FREIGHT
+  CUSTOMS_DUTY
+  CLEARING
+  INSURANCE
+  LOCAL_TRANSPORT
+  OTHER
+}
+
+enum AllocationMethod {
+  BY_VALUE
+  BY_QUANTITY
+  BY_WEIGHT
+}
+
+model LandedCost {
+  id             String           @id @default(cuid())
+  goodsReceiptId String
+  type           LandedCostType
+  amountAed      Decimal          @db.Decimal(14, 2)
+  method         AllocationMethod @default(BY_VALUE)
+  reference      String?
+
+  goodsReceipt GoodsReceipt @relation(fields: [goodsReceiptId], references: [id], onDelete: Cascade)
+}
+
+enum BillStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  CANCELLED
+}
+
+// Supplier invoice (accounts payable)
+model SupplierBill {
+  id              String     @id @default(cuid())
+  number          String     @unique // internal number
+  supplierRef     String // supplier's own invoice number
+  supplierId      String
+  purchaseOrderId String?
+  billDate        DateTime
+  dueDate         DateTime?
+  currencyCode    String     @default("AED")
+  exchangeRate    Decimal    @default(1) @db.Decimal(14, 6)
+  subtotal        Decimal    @db.Decimal(14, 2)
+  vatAmount       Decimal    @default(0) @db.Decimal(14, 2) // input VAT (recoverable)
+  total           Decimal    @db.Decimal(14, 2)
+  totalAed        Decimal    @db.Decimal(14, 2)
+  amountPaid      Decimal    @default(0) @db.Decimal(14, 2)
+  status          BillStatus @default(UNPAID)
+  createdAt       DateTime   @default(now())
+  updatedAt       DateTime   @updatedAt
+
+  supplier      Supplier            @relation(fields: [supplierId], references: [id])
+  purchaseOrder PurchaseOrder?      @relation(fields: [purchaseOrderId], references: [id])
+  allocations   PaymentAllocation[]
+}
+
+// =============================================================================
+// 5. SALES & CRM: customers, leads, activities, quotations, orders, invoices
+// =============================================================================
+
+enum CustomerType {
+  RETAILER
+  SALON
+  ONLINE_SELLER
+  DISTRIBUTOR
+  EXPORT_BUYER
+  CORPORATE
+  OTHER
+}
+
+enum CustomerStatus {
+  PROSPECT
+  PENDING_VERIFICATION // trade licence / TRN being checked
+  ACTIVE
+  ON_HOLD // e.g. over credit limit
+  BLOCKED
+}
+
+// A business customer (wholesale / B2B)
+model Customer {
+  id                 String         @id @default(cuid())
+  code               String         @unique // CUS-0001
+  type               CustomerType
+  status             CustomerStatus @default(PROSPECT)
+  companyName        String
+  tradeLicenceNo     String?
+  tradeLicenceExpiry DateTime?      @db.Date
+  trn                String? // UAE VAT registration number
+  countryCode        String         @default("AE")
+  emirate            String?
+  city               String?
+  address            String?
+  contactName        String?
+  email              String?
+  phone              String?
+  whatsapp           String?
+  website            String?
+  instagram          String?
+  priceTier          PriceTier      @default(C)
+  priceListId        String?
+  currencyCode       String         @default("AED")
+  creditLimitAed     Decimal        @default(0) @db.Decimal(14, 2)
+  paymentTermsDays   Int            @default(0) // 0 = cash / advance
+  salespersonId      String?
+  marketingOptIn     Boolean        @default(false)
+  whatsappOptIn      Boolean        @default(false)
+  notes              String?
+  createdAt          DateTime       @default(now())
+  updatedAt          DateTime       @updatedAt
+
+  country              Country?              @relation(fields: [countryCode], references: [code])
+  priceList            PriceList?            @relation(fields: [priceListId], references: [id])
+  salesperson          User?                 @relation("CustomerSalesperson", fields: [salespersonId], references: [id])
+  portalUsers          User[]                @relation("CustomerPortalUsers")
+  contacts             CustomerContact[]
+  addresses            Address[]
+  leads                Lead[]
+  activities           Activity[]
+  quotations           Quotation[]
+  salesOrders          SalesOrder[]
+  invoices             Invoice[]
+  creditNotes          CreditNote[]
+  payments             Payment[]
+  pdcs                 PostDatedCheque[]
+  shipments            Shipment[]
+  documents            Document[]
+  segmentMembers       SegmentMember[]
+  campaignAttributions CampaignAttribution[]
+
+  @@index([type, status])
+  @@index([salespersonId])
+}
+
+model CustomerContact {
+  id         String  @id @default(cuid())
+  customerId String
+  name       String
+  position   String?
+  email      String?
+  phone      String?
+  whatsapp   String?
+  isPrimary  Boolean @default(false)
+
+  customer Customer @relation(fields: [customerId], references: [id], onDelete: Cascade)
+}
+
+enum AddressType {
+  BILLING
+  SHIPPING
+}
+
+model Address {
+  id               String      @id @default(cuid())
+  type             AddressType
+  customerId       String?
+  retailCustomerId String?
+  label            String?
+  line1            String
+  line2            String?
+  area             String?
+  city             String
+  emirate          String?
+  countryCode      String      @default("AE")
+  phone            String?
+  isDefault        Boolean     @default(false)
+
+  customer       Customer?       @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  retailCustomer RetailCustomer? @relation(fields: [retailCustomerId], references: [id], onDelete: Cascade)
+}
+
+enum LeadStage {
+  NEW
+  CONTACTED
+  SAMPLE_SENT
+  NEGOTIATION
+  WON
+  LOST
+}
+
+model Lead {
+  id               String        @id @default(cuid())
+  stage            LeadStage     @default(NEW)
+  companyName      String
+  contactName      String?
+  email            String?
+  phone            String?
+  whatsapp         String?
+  customerType     CustomerType?
+  countryCode      String?
+  interestedBrands String[]
+  estValueAed      Decimal?      @db.Decimal(14, 2)
+  ownerId          String?
+  customerId       String? // set when converted
+  // Marketing attribution: where did this lead come from?
+  leadSourceId     String?
+  campaignId       String?
+  landingPageId    String?
+  utmSource        String?
+  utmMedium        String?
+  utmCampaign      String?
+  lostReason       String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  owner       User?        @relation("LeadOwner", fields: [ownerId], references: [id])
+  customer    Customer?    @relation(fields: [customerId], references: [id])
+  leadSource  LeadSource?  @relation(fields: [leadSourceId], references: [id])
+  campaign    Campaign?    @relation(fields: [campaignId], references: [id])
+  landingPage LandingPage? @relation(fields: [landingPageId], references: [id])
+  activities  Activity[]
+
+  @@index([stage, ownerId])
+  @@index([campaignId])
+}
+
+model LeadSource {
+  id   String @id @default(cuid())
+  name String @unique // Instagram, Referral, Walk-in, Exhibition, Landing page, WhatsApp...
+
+  leads Lead[]
+}
+
+enum ActivityType {
+  CALL
+  MEETING
+  WHATSAPP
+  EMAIL
+  VISIT
+  NOTE
+  TASK
+}
+
+model Activity {
+  id         String       @id @default(cuid())
+  type       ActivityType
+  subject    String
+  body       String?
+  dueAt      DateTime?
+  doneAt     DateTime?
+  userId     String
+  customerId String?
+  leadId     String?
+  createdAt  DateTime     @default(now())
+
+  user     User      @relation(fields: [userId], references: [id])
+  customer Customer? @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  lead     Lead?     @relation(fields: [leadId], references: [id], onDelete: Cascade)
+
+  @@index([userId, dueAt])
+}
+
+enum QuotationStatus {
+  DRAFT
+  PENDING_APPROVAL
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+  CONVERTED
+}
+
+model Quotation {
+  id           String          @id @default(cuid())
+  number       String          @unique // LUX-QT-2026-0001
+  customerId   String
+  status       QuotationStatus @default(DRAFT)
+  issueDate    DateTime        @default(now())
+  validUntil   DateTime?
+  currencyCode String          @default("AED")
+  exchangeRate Decimal         @default(1) @db.Decimal(14, 6)
+  subtotal     Decimal         @default(0) @db.Decimal(14, 2)
+  discount     Decimal         @default(0) @db.Decimal(14, 2)
+  vatAmount    Decimal         @default(0) @db.Decimal(14, 2)
+  total        Decimal         @default(0) @db.Decimal(14, 2)
+  terms        String?
+  notes        String?
+  createdById  String
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  customer   Customer        @relation(fields: [customerId], references: [id])
+  createdBy  User            @relation("QuotationCreatedBy", fields: [createdById], references: [id])
+  lines      QuotationLine[]
+  salesOrder SalesOrder?
+}
+
+model QuotationLine {
+  id            String  @id @default(cuid())
+  quotationId   String
+  variantId     String
+  description   String?
+  quantity      Int
+  unitPrice     Decimal @db.Decimal(14, 2)
+  discountPct   Decimal @default(0) @db.Decimal(5, 2)
+  vatRate       Decimal @default(5) @db.Decimal(5, 2)
+  lineTotal     Decimal @db.Decimal(14, 2)
+  belowMinPrice Boolean @default(false) // triggers DISCOUNT_BELOW_MIN approval
+
+  quotation Quotation      @relation(fields: [quotationId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+enum SalesChannel {
+  WHOLESALE // created by sales staff
+  B2B_PORTAL // ordered by customer in portal
+  WEB_STORE // retail storefront
+  EXPORT
+}
+
+enum SalesOrderStatus {
+  DRAFT
+  PENDING_APPROVAL
+  CONFIRMED // stock reserved
+  PICKING
+  PACKED
+  PARTIALLY_DELIVERED
+  DELIVERED
+  INVOICED
+  CANCELLED
+}
+
+enum PaymentStatus {
+  UNPAID
+  PARTIALLY_PAID
+  PAID
+  REFUNDED
+}
+
+// One order model for every channel, so stock reservation logic is shared
+model SalesOrder {
+  id               String           @id @default(cuid())
+  number           String           @unique // LUX-SO-2026-0001 / LUX-WEB-2026-0001
+  channel          SalesChannel
+  status           SalesOrderStatus @default(DRAFT)
+  paymentStatus    PaymentStatus    @default(UNPAID)
+  customerId       String? // business customer (wholesale/B2B/export)
+  retailCustomerId String? // web shopper
+  quotationId      String?          @unique
+  warehouseId      String?
+  salespersonId    String?
+  orderDate        DateTime         @default(now())
+  requiredBy       DateTime?
+  currencyCode     String           @default("AED")
+  exchangeRate     Decimal          @default(1) @db.Decimal(14, 6)
+  subtotal         Decimal          @default(0) @db.Decimal(14, 2)
+  discount         Decimal          @default(0) @db.Decimal(14, 2)
+  shippingFee      Decimal          @default(0) @db.Decimal(14, 2)
+  vatAmount        Decimal          @default(0) @db.Decimal(14, 2)
+  total            Decimal          @default(0) @db.Decimal(14, 2)
+  totalAed         Decimal          @default(0) @db.Decimal(14, 2)
+  couponId         String?
+  isCashOnDelivery Boolean          @default(false)
+  giftWrap         Boolean          @default(false)
+  giftMessage      String?
+  shippingAddress  Json? // snapshot at time of order
+  notes            String?
+  // Marketing attribution
+  campaignId       String?
+  utmSource        String?
+  utmMedium        String?
+  utmCampaign      String?
+  createdById      String?
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  customer       Customer?        @relation(fields: [customerId], references: [id])
+  retailCustomer RetailCustomer?  @relation(fields: [retailCustomerId], references: [id])
+  quotation      Quotation?       @relation(fields: [quotationId], references: [id])
+  warehouse      Warehouse?       @relation(fields: [warehouseId], references: [id])
+  salesperson    User?            @relation("SalesOrderSalesperson", fields: [salespersonId], references: [id])
+  createdBy      User?            @relation("SalesOrderCreatedBy", fields: [createdById], references: [id])
+  coupon         Coupon?          @relation(fields: [couponId], references: [id])
+  campaign       Campaign?        @relation(fields: [campaignId], references: [id])
+  lines          SalesOrderLine[]
+  deliveryNotes  DeliveryNote[]
+  invoices       Invoice[]
+  shipments      Shipment[]
+  onlinePayments OnlinePayment[]
+  commissions    Commission[]
+
+  @@index([channel, status])
+  @@index([customerId])
+  @@index([campaignId])
+}
+
+model SalesOrderLine {
+  id            String  @id @default(cuid())
+  salesOrderId  String
+  variantId     String
+  quantity      Int
+  deliveredQty  Int     @default(0)
+  unitPrice     Decimal @db.Decimal(14, 2)
+  discountPct   Decimal @default(0) @db.Decimal(5, 2)
+  vatRate       Decimal @default(5) @db.Decimal(5, 2)
+  lineTotal     Decimal @db.Decimal(14, 2)
+  unitCostAed   Decimal @default(0) @db.Decimal(14, 2) // for profit reports
+  belowMinPrice Boolean @default(false)
+
+  salesOrder SalesOrder     @relation(fields: [salesOrderId], references: [id], onDelete: Cascade)
+  variant    ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+model DeliveryNote {
+  id           String   @id @default(cuid())
+  number       String   @unique // LUX-DN-2026-0001
+  salesOrderId String
+  warehouseId  String
+  deliveredOn  DateTime @default(now())
+  receivedBy   String? // name of person who signed
+  signatureUrl String?
+  notes        String?
+  createdAt    DateTime @default(now())
+
+  salesOrder SalesOrder         @relation(fields: [salesOrderId], references: [id])
+  warehouse  Warehouse          @relation(fields: [warehouseId], references: [id])
+  lines      DeliveryNoteLine[]
+}
+
+model DeliveryNoteLine {
+  id             String @id @default(cuid())
+  deliveryNoteId String
+  variantId      String
+  batchId        String // FEFO-picked batch
+  quantity       Int
+
+  deliveryNote DeliveryNote   @relation(fields: [deliveryNoteId], references: [id], onDelete: Cascade)
+  variant      ProductVariant @relation(fields: [variantId], references: [id])
+  batch        Batch          @relation(fields: [batchId], references: [id])
+}
+
+enum InvoiceType {
+  TAX_INVOICE // standard 5% VAT
+  SIMPLIFIED_TAX_INVOICE // retail / B2C
+  EXPORT_INVOICE // zero-rated
+  AGENCY_INVOICE // advertising services (8B)
+}
+
+enum InvoiceStatus {
+  DRAFT
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  VOID
+}
+
+// Tax invoice: English + Arabic, shows TRNs, VAT in AED, signed by the Manager
+model Invoice {
+  id               String        @id @default(cuid())
+  number           String        @unique // LUX-INV-2026-0001
+  type             InvoiceType   @default(TAX_INVOICE)
+  status           InvoiceStatus @default(DRAFT)
+  customerId       String?
+  adClientId       String?
+  retailCustomerId String?
+  salesOrderId     String?
+  adContractId     String?
+  issueDate        DateTime      @default(now())
+  supplyDate       DateTime?
+  dueDate          DateTime?
+  currencyCode     String        @default("AED")
+  exchangeRate     Decimal       @default(1) @db.Decimal(14, 6)
+  subtotal         Decimal       @db.Decimal(14, 2)
+  discount         Decimal       @default(0) @db.Decimal(14, 2)
+  vatAmount        Decimal       @db.Decimal(14, 2)
+  total            Decimal       @db.Decimal(14, 2)
+  vatAmountAed     Decimal       @db.Decimal(14, 2) // FTA requires VAT shown in AED
+  totalAed         Decimal       @db.Decimal(14, 2)
+  amountPaid       Decimal       @default(0) @db.Decimal(14, 2)
+  customerTrn      String? // snapshot at issue time
+  billToSnapshot   Json?
+  signatoryName    String? // "Althaf Najeeb"
+  signatoryTitle   String? // "Manager"
+  pdfUrl           String?
+  notes            String?
+  createdAt        DateTime      @default(now())
+  updatedAt        DateTime      @updatedAt
+
+  customer       Customer?           @relation(fields: [customerId], references: [id])
+  adClient       AdClient?           @relation(fields: [adClientId], references: [id])
+  retailCustomer RetailCustomer?     @relation(fields: [retailCustomerId], references: [id])
+  salesOrder     SalesOrder?         @relation(fields: [salesOrderId], references: [id])
+  adContract     AdContract?         @relation(fields: [adContractId], references: [id])
+  lines          InvoiceLine[]
+  creditNotes    CreditNote[]
+  allocations    PaymentAllocation[]
+
+  @@index([status, dueDate])
+  @@index([customerId])
+  @@index([adClientId])
+}
+
+enum VatCategory {
+  STANDARD // 5%
+  ZERO_RATED // exports
+  EXEMPT
+  OUT_OF_SCOPE
+}
+
+model InvoiceLine {
+  id          String      @id @default(cuid())
+  invoiceId   String
+  variantId   String? // product line
+  serviceCode String? // agency service line (e.g. package key)
+  description String
+  quantity    Decimal     @db.Decimal(14, 2)
+  unitPrice   Decimal     @db.Decimal(14, 2)
+  discountPct Decimal     @default(0) @db.Decimal(5, 2)
+  vatCategory VatCategory @default(STANDARD)
+  vatRate     Decimal     @default(5) @db.Decimal(5, 2)
+  vatAmount   Decimal     @db.Decimal(14, 2)
+  lineTotal   Decimal     @db.Decimal(14, 2)
+
+  invoice Invoice         @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  variant ProductVariant? @relation(fields: [variantId], references: [id])
+}
+
+enum CreditNoteStatus {
+  DRAFT
+  PENDING_APPROVAL
+  ISSUED
+  APPLIED
+  VOID
+}
+
+model CreditNote {
+  id         String           @id @default(cuid())
+  number     String           @unique // LUX-CN-2026-0001
+  invoiceId  String
+  customerId String?
+  status     CreditNoteStatus @default(DRAFT)
+  reason     String
+  issueDate  DateTime         @default(now())
+  subtotal   Decimal          @db.Decimal(14, 2)
+  vatAmount  Decimal          @db.Decimal(14, 2)
+  total      Decimal          @db.Decimal(14, 2)
+  restock    Boolean          @default(false) // returned goods go back to stock
+  createdAt  DateTime         @default(now())
+
+  invoice  Invoice          @relation(fields: [invoiceId], references: [id])
+  customer Customer?        @relation(fields: [customerId], references: [id])
+  lines    CreditNoteLine[]
+}
+
+model CreditNoteLine {
+  id           String  @id @default(cuid())
+  creditNoteId String
+  variantId    String?
+  description  String
+  quantity     Decimal @db.Decimal(14, 2)
+  unitPrice    Decimal @db.Decimal(14, 2)
+  vatRate      Decimal @default(5) @db.Decimal(5, 2)
+  lineTotal    Decimal @db.Decimal(14, 2)
+
+  creditNote CreditNote      @relation(fields: [creditNoteId], references: [id], onDelete: Cascade)
+  variant    ProductVariant? @relation(fields: [variantId], references: [id])
+}
+
+enum CommissionStatus {
+  PENDING
+  APPROVED
+  PAID
+}
+
+model Commission {
+  id           String           @id @default(cuid())
+  userId       String
+  salesOrderId String
+  ratePct      Decimal          @db.Decimal(5, 2)
+  baseAmount   Decimal          @db.Decimal(14, 2) // usually gross profit or net sales
+  amount       Decimal          @db.Decimal(14, 2)
+  status       CommissionStatus @default(PENDING)
+  period       String // "2026-10"
+  createdAt    DateTime         @default(now())
+
+  user       User       @relation(fields: [userId], references: [id])
+  salesOrder SalesOrder @relation(fields: [salesOrderId], references: [id])
+
+  @@index([userId, period])
+}
+
+// =============================================================================
+// 6. RETAIL STOREFRONT: shoppers, carts, wishlists, reviews, online payments
+// =============================================================================
+
+model RetailCustomer {
+  id             String   @id @default(cuid())
+  userId         String?  @unique // null = guest checkout
+  firstName      String
+  lastName       String?
+  email          String
+  phone          String?
+  marketingOptIn Boolean  @default(false)
+  whatsappOptIn  Boolean  @default(false)
+  loyaltyPoints  Int      @default(0)
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  user           User?                @relation(fields: [userId], references: [id])
+  addresses      Address[]
+  orders         SalesOrder[]
+  invoices       Invoice[]
+  carts          Cart[]
+  wishlist       WishlistItem[]
+  loyaltyLedger  LoyaltyTransaction[]
+  segmentMembers SegmentMember[]
+
+  @@index([email])
+}
+
+model Cart {
+  id               String   @id @default(cuid())
+  retailCustomerId String?
+  sessionKey       String?  @unique // guests
+  couponCode       String?
+  createdAt        DateTime @default(now())
+  updatedAt        DateTime @updatedAt
+
+  retailCustomer RetailCustomer? @relation(fields: [retailCustomerId], references: [id], onDelete: Cascade)
+  items          CartItem[]
+}
+
+model CartItem {
+  id        String @id @default(cuid())
+  cartId    String
+  variantId String
+  quantity  Int
+
+  cart    Cart           @relation(fields: [cartId], references: [id], onDelete: Cascade)
+  variant ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@unique([cartId, variantId])
+}
+
+model WishlistItem {
+  retailCustomerId String
+  variantId        String
+  createdAt        DateTime @default(now())
+
+  retailCustomer RetailCustomer @relation(fields: [retailCustomerId], references: [id], onDelete: Cascade)
+  variant        ProductVariant @relation(fields: [variantId], references: [id])
+
+  @@id([retailCustomerId, variantId])
+}
+
+model ProductReview {
+  id         String   @id @default(cuid())
+  productId  String
+  userId     String
+  rating     Int // 1–5
+  title      String?
+  body       String?
+  isApproved Boolean  @default(false)
+  createdAt  DateTime @default(now())
+
+  product Product @relation(fields: [productId], references: [id], onDelete: Cascade)
+  user    User    @relation(fields: [userId], references: [id])
+
+  @@unique([productId, userId])
+}
+
+model LoyaltyTransaction {
+  id               String   @id @default(cuid())
+  retailCustomerId String
+  points           Int // + earned, − redeemed
+  reason           String
+  refType          String?
+  refId            String?
+  createdAt        DateTime @default(now())
+
+  retailCustomer RetailCustomer @relation(fields: [retailCustomerId], references: [id], onDelete: Cascade)
+}
+
+enum PaymentGateway {
+  STRIPE
+  TELR
+  PAYTABS
+  NETWORK_INTERNATIONAL
+  CASH_ON_DELIVERY
+}
+
+enum OnlinePaymentStatus {
+  INITIATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+model OnlinePayment {
+  id           String              @id @default(cuid())
+  salesOrderId String?
+  invoiceId    String? // ad clients paying invoices online
+  gateway      PaymentGateway
+  gatewayRef   String?             @unique
+  amount       Decimal             @db.Decimal(14, 2)
+  currencyCode String              @default("AED")
+  status       OnlinePaymentStatus @default(INITIATED)
+  rawResponse  Json?
+  createdAt    DateTime            @default(now())
+  updatedAt    DateTime            @updatedAt
+
+  salesOrder SalesOrder? @relation(fields: [salesOrderId], references: [id])
+}
+
+// =============================================================================
+// 7. FINANCE: chart of accounts, journals, payments, PDCs, bank, expenses
+// =============================================================================
+
+enum AccountType {
+  ASSET
+  LIABILITY
+  EQUITY
+  INCOME
+  EXPENSE
+}
+
+model Account {
+  id        String      @id @default(cuid())
+  code      String      @unique // 1000 Cash, 1100 Bank, 1200 Receivables, 1300 Inventory, 2100 VAT Payable...
+  name      String
+  type      AccountType
+  parentId  String?
+  isSystem  Boolean     @default(false) // used by auto-posting, cannot be deleted
+  isActive  Boolean     @default(true)
+  createdAt DateTime    @default(now())
+
+  parent       Account?      @relation("AccountTree", fields: [parentId], references: [id])
+  children     Account[]     @relation("AccountTree")
+  journalLines JournalLine[]
+  bankAccount  BankAccount?
+  expenses     Expense[]
+}
+
+enum JournalSource {
+  MANUAL
+  SALES_INVOICE
+  CREDIT_NOTE
+  SUPPLIER_BILL
+  PAYMENT_RECEIVED
+  PAYMENT_MADE
+  EXPENSE
+  STOCK_ADJUSTMENT
+  COGS
+  PAYROLL
+  AD_SPEND
+  OPENING
+}
+
+// Append-only: corrections are made with a reversing entry
+model JournalEntry {
+  id           String        @id @default(cuid())
+  number       String        @unique // LUX-JE-2026-0001
+  date         DateTime      @db.Date
+  source       JournalSource
+  refType      String?
+  refId        String?
+  memo         String?
+  reversalOfId String?       @unique
+  createdById  String?
+  createdAt    DateTime      @default(now())
+
+  createdBy  User?         @relation(fields: [createdById], references: [id])
+  reversalOf JournalEntry? @relation("JournalReversal", fields: [reversalOfId], references: [id])
+  reversedBy JournalEntry? @relation("JournalReversal")
+  lines      JournalLine[]
+
+  @@index([date])
+  @@index([refType, refId])
+}
+
+model JournalLine {
+  id             String  @id @default(cuid())
+  journalEntryId String
+  accountId      String
+  debit          Decimal @default(0) @db.Decimal(14, 2) // AED
+  credit         Decimal @default(0) @db.Decimal(14, 2) // AED
+  description    String?
+  // Optional dimensions for reports (profit by brand / customer / campaign)
+  brandId        String?
+  customerId     String?
+  campaignId     String?
+  adClientId     String?
+
+  journalEntry JournalEntry @relation(fields: [journalEntryId], references: [id], onDelete: Cascade)
+  account      Account      @relation(fields: [accountId], references: [id])
+
+  @@index([accountId])
+}
+
+model BankAccount {
+  id           String  @id @default(cuid())
+  accountId    String  @unique // linked ledger account
+  bankName     String
+  accountName  String
+  accountNo    String?
+  iban         String?
+  swift        String?
+  currencyCode String  @default("AED")
+  isActive     Boolean @default(true)
+
+  account  Account           @relation(fields: [accountId], references: [id])
+  payments Payment[]
+  pdcs     PostDatedCheque[]
+}
+
+enum PaymentDirection {
+  RECEIVED // from customer / ad client
+  MADE // to supplier / influencer / expense
+}
+
+enum PaymentMethod {
+  CASH
+  BANK_TRANSFER
+  CHEQUE
+  PDC
+  CARD
+  ONLINE_GATEWAY
+  CASH_ON_DELIVERY
+}
+
+model Payment {
+  id            String           @id @default(cuid())
+  number        String           @unique // LUX-PAY-2026-0001
+  direction     PaymentDirection
+  method        PaymentMethod
+  date          DateTime         @default(now())
+  amount        Decimal          @db.Decimal(14, 2)
+  currencyCode  String           @default("AED")
+  exchangeRate  Decimal          @default(1) @db.Decimal(14, 6)
+  amountAed     Decimal          @db.Decimal(14, 2)
+  customerId    String?
+  adClientId    String?
+  supplierId    String?
+  influencerId  String?
+  bankAccountId String?
+  reference     String? // transfer ref, cheque no.
+  notes         String?
+  createdAt     DateTime         @default(now())
+
+  customer    Customer?           @relation(fields: [customerId], references: [id])
+  adClient    AdClient?           @relation(fields: [adClientId], references: [id])
+  supplier    Supplier?           @relation(fields: [supplierId], references: [id])
+  influencer  Influencer?         @relation(fields: [influencerId], references: [id])
+  bankAccount BankAccount?        @relation(fields: [bankAccountId], references: [id])
+  allocations PaymentAllocation[]
+  pdc         PostDatedCheque?
+}
+
+// Links one payment to one or more invoices / bills
+model PaymentAllocation {
+  id             String  @id @default(cuid())
+  paymentId      String
+  invoiceId      String?
+  supplierBillId String?
+  amount         Decimal @db.Decimal(14, 2)
+
+  payment      Payment       @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  invoice      Invoice?      @relation(fields: [invoiceId], references: [id])
+  supplierBill SupplierBill? @relation(fields: [supplierBillId], references: [id])
+}
+
+enum PdcStatus {
+  RECEIVED
+  DEPOSITED
+  CLEARED
+  BOUNCED
+  RETURNED
+  CANCELLED
+}
+
+// Post-dated cheques: very common in UAE trade
+model PostDatedCheque {
+  id            String           @id @default(cuid())
+  direction     PaymentDirection
+  chequeNo      String
+  bankName      String
+  chequeDate    DateTime         @db.Date
+  amount        Decimal          @db.Decimal(14, 2)
+  status        PdcStatus        @default(RECEIVED)
+  customerId    String?
+  bankAccountId String? // where it was deposited
+  paymentId     String?          @unique // created when cleared
+  imageUrl      String?
+  notes         String?
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+
+  customer    Customer?    @relation(fields: [customerId], references: [id])
+  bankAccount BankAccount? @relation(fields: [bankAccountId], references: [id])
+  payment     Payment?     @relation(fields: [paymentId], references: [id])
+
+  @@index([status, chequeDate])
+}
+
+model Expense {
+  id           String         @id @default(cuid())
+  number       String         @unique // LUX-EXP-2026-0001
+  date         DateTime       @db.Date
+  accountId    String // expense account (rent, ads, salaries, freight...)
+  vendor       String?
+  vendorTrn    String?
+  description  String
+  amount       Decimal        @db.Decimal(14, 2) // before VAT
+  vatAmount    Decimal        @default(0) @db.Decimal(14, 2) // recoverable input VAT
+  total        Decimal        @db.Decimal(14, 2)
+  currencyCode String         @default("AED")
+  paidVia      PaymentMethod?
+  receiptUrl   String?
+  campaignId   String? // ad spend linked to a campaign
+  createdById  String?
+  createdAt    DateTime       @default(now())
+
+  account   Account   @relation(fields: [accountId], references: [id])
+  campaign  Campaign? @relation(fields: [campaignId], references: [id])
+  createdBy User?     @relation(fields: [createdById], references: [id])
+}
+
+enum VatReturnStatus {
+  DRAFT
+  FILED
+  PAID
+}
+
+// Saved VAT201 return per quarter
+model VatReturn {
+  id                    String          @id @default(cuid())
+  periodStart           DateTime        @db.Date
+  periodEnd             DateTime        @db.Date
+  status                VatReturnStatus @default(DRAFT)
+  standardRatedSales    Decimal         @db.Decimal(14, 2)
+  outputVat             Decimal         @db.Decimal(14, 2)
+  zeroRatedSales        Decimal         @db.Decimal(14, 2)
+  exemptSales           Decimal         @db.Decimal(14, 2)
+  standardRatedExpenses Decimal         @db.Decimal(14, 2)
+  inputVat              Decimal         @db.Decimal(14, 2)
+  netVatDue             Decimal         @db.Decimal(14, 2)
+  breakdown             Json? // by emirate, as the VAT201 form requires
+  filedAt               DateTime?
+  ftaReference          String?
+  createdAt             DateTime        @default(now())
+
+  @@unique([periodStart, periodEnd])
+}
+
+// =============================================================================
+// 8. SHIPPING & EXPORT
+// =============================================================================
+
+enum ShipmentStatus {
+  PENDING
+  PICKED_UP
+  IN_TRANSIT
+  CUSTOMS
+  OUT_FOR_DELIVERY
+  DELIVERED
+  FAILED
+  RETURNED
+}
+
+enum ShipmentMode {
+  OWN_DRIVER
+  COURIER
+  AIR_FREIGHT
+  SEA_FREIGHT
+  ROAD_FREIGHT
+}
+
+model Shipment {
+  id                     String         @id @default(cuid())
+  number                 String         @unique // LUX-SHP-2026-0001
+  salesOrderId           String?
+  customerId             String?
+  mode                   ShipmentMode
+  carrier                String? // Aramex, DHL, Quiq, Jeebly, own driver...
+  trackingNo             String? // AWB / BL number
+  status                 ShipmentStatus @default(PENDING)
+  destinationCountryCode String         @default("AE")
+  incoterm               String? // EXW, FOB, CIF, DAP...
+  packages               Int            @default(1)
+  grossWeightKg          Decimal?       @db.Decimal(10, 2)
+  shippingCostAed        Decimal?       @db.Decimal(14, 2)
+  shippedAt              DateTime?
+  deliveredAt            DateTime?
+  createdAt              DateTime       @default(now())
+  updatedAt              DateTime       @updatedAt
+
+  salesOrder SalesOrder?     @relation(fields: [salesOrderId], references: [id])
+  customer   Customer?       @relation(fields: [customerId], references: [id])
+  events     ShipmentEvent[]
+  documents  Document[]
+}
+
+model ShipmentEvent {
+  id         String         @id @default(cuid())
+  shipmentId String
+  status     ShipmentStatus
+  location   String?
+  note       String?
+  occurredAt DateTime       @default(now())
+
+  shipment Shipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+}
+
+// =============================================================================
+// 9. COMPANY: document vault (licences, certificates), HR
+// =============================================================================
+
+enum DocumentType {
+  TRADE_LICENCE
+  ESTABLISHMENT_CARD
+  VAT_CERTIFICATE
+  MEDIA_COUNCIL_LICENCE
+  INSURANCE
+  TENANCY_FLEXI_DESK
+  MEMORANDUM_OF_ASSOCIATION
+  SUPPLIER_INVOICE // authenticity proof for batches
+  CERTIFICATE_OF_ORIGIN
+  CUSTOMER_TRADE_LICENCE
+  EMPLOYEE_VISA
+  EMIRATES_ID
+  PASSPORT
+  CONTRACT
+  AIRWAY_BILL
+  BILL_OF_LADING
+  PACKING_LIST
+  OTHER
+}
+
+// Every uploaded file with optional expiry. Alerts at 90/60/30/7 days.
+model Document {
+  id           String       @id @default(cuid())
+  type         DocumentType
+  title        String
+  number       String? // e.g. licence no. 2541889.01
+  issuer       String? // e.g. SHAMS
+  issuedOn     DateTime?    @db.Date
+  expiresOn    DateTime?    @db.Date
+  fileUrl      String
+  mimeType     String?
+  isCompanyDoc Boolean      @default(false)
+  // What the document belongs to (at most one is set)
+  customerId   String?
+  supplierId   String?
+  batchId      String?
+  employeeId   String?
+  influencerId String?
+  adClientId   String?
+  shipmentId   String?
+  uploadedById String?
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  customer   Customer?     @relation(fields: [customerId], references: [id])
+  supplier   Supplier?     @relation(fields: [supplierId], references: [id])
+  batch      Batch?        @relation(fields: [batchId], references: [id])
+  employee   Employee?     @relation(fields: [employeeId], references: [id])
+  influencer Influencer?   @relation(fields: [influencerId], references: [id])
+  adClient   AdClient?     @relation(fields: [adClientId], references: [id])
+  shipment   Shipment?     @relation(fields: [shipmentId], references: [id])
+  uploadedBy User?         @relation(fields: [uploadedById], references: [id])
+  alerts     ExpiryAlert[]
+
+  @@index([expiresOn])
+  @@index([type])
+}
+
+model ExpiryAlert {
+  id         String   @id @default(cuid())
+  documentId String
+  daysBefore Int // 90, 60, 30, 7, 0
+  sentAt     DateTime @default(now())
+
+  document Document @relation(fields: [documentId], references: [id], onDelete: Cascade)
+
+  @@unique([documentId, daysBefore])
+}
+
+enum EmploymentStatus {
+  ACTIVE
+  ON_LEAVE
+  TERMINATED
+}
+
+model Employee {
+  id               String           @id @default(cuid())
+  userId           String?          @unique
+  employeeNo       String           @unique
+  fullName         String
+  position         String
+  department       String?
+  nationality      String?
+  joinDate         DateTime         @db.Date
+  status           EmploymentStatus @default(ACTIVE)
+  basicSalaryAed   Decimal          @db.Decimal(14, 2)
+  allowancesAed    Decimal          @default(0) @db.Decimal(14, 2)
+  commissionPct    Decimal          @default(0) @db.Decimal(5, 2)
+  bankName         String?
+  iban             String? // WPS
+  molPersonalId    String? // labour card / personal ID for WPS
+  emiratesIdNo     String?
+  emiratesIdExpiry DateTime?        @db.Date
+  visaExpiry       DateTime?        @db.Date
+  passportNo       String?
+  passportExpiry   DateTime?        @db.Date
+  createdAt        DateTime         @default(now())
+  updatedAt        DateTime         @updatedAt
+
+  user      User?          @relation(fields: [userId], references: [id])
+  documents Document[]
+  leaves    LeaveRequest[]
+  payslips  Payslip[]
+}
+
+enum LeaveType {
+  ANNUAL
+  SICK
+  UNPAID
+  OTHER
+}
+
+enum LeaveStatus {
+  REQUESTED
+  APPROVED
+  REJECTED
+}
+
+model LeaveRequest {
+  id         String      @id @default(cuid())
+  employeeId String
+  type       LeaveType
+  startDate  DateTime    @db.Date
+  endDate    DateTime    @db.Date
+  status     LeaveStatus @default(REQUESTED)
+  reason     String?
+  createdAt  DateTime    @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+}
+
+model Payslip {
+  id            String    @id @default(cuid())
+  employeeId    String
+  period        String // "2026-10"
+  basicAed      Decimal   @db.Decimal(14, 2)
+  allowancesAed Decimal   @db.Decimal(14, 2)
+  commissionAed Decimal   @default(0) @db.Decimal(14, 2)
+  deductionsAed Decimal   @default(0) @db.Decimal(14, 2)
+  netAed        Decimal   @db.Decimal(14, 2)
+  paidAt        DateTime?
+  createdAt     DateTime  @default(now())
+
+  employee Employee @relation(fields: [employeeId], references: [id], onDelete: Cascade)
+
+  @@unique([employeeId, period])
+}
+
+// =============================================================================
+// 10. ADVERTISING 8A: in-house marketing
+// =============================================================================
+
+enum CampaignObjective {
+  AWARENESS
+  TRAFFIC
+  LEADS
+  SALES
+  B2B_SIGNUPS
+  ENGAGEMENT
+}
+
+enum CampaignStatus {
+  DRAFT
+  COMPLIANCE_CHECK
+  PENDING_APPROVAL // waiting for Manager (CAMPAIGN_GO_LIVE)
+  APPROVED
+  LIVE
+  PAUSED
+  COMPLETED
+  CANCELLED
+}
+
+enum CampaignOwnerType {
+  IN_HOUSE // LUXORA's own promotion (8A)
+  AGENCY_CLIENT // run for an outside client (8B)
+}
+
+enum Audience {
+  B2B
+  RETAIL
+  BOTH
+}
+
+enum Channel {
+  INSTAGRAM
+  FACEBOOK
+  TIKTOK
+  SNAPCHAT
+  GOOGLE_ADS
+  YOUTUBE
+  WHATSAPP
+  EMAIL
+  SMS
+  INFLUENCER
+  WEBSITE_BANNER
+  NEWSLETTER
+  OTHER
+}
+
+// Used by both in-house campaigns and agency client campaigns
+model Campaign {
+  id            String            @id @default(cuid())
+  code          String            @unique // LUX-CMP-2026-0001
+  name          String
+  ownerType     CampaignOwnerType @default(IN_HOUSE)
+  adClientId    String? // set for agency campaigns
+  adContractId  String?
+  objective     CampaignObjective
+  status        CampaignStatus    @default(DRAFT)
+  audience      Audience          @default(BOTH)
+  targetMarkets String[] // ["AE", "SA", "GCC", "INTL"]
+  description   String?
+  seasonTag     String? // RAMADAN, EID, NATIONAL_DAY, DSF, WHITE_FRIDAY...
+  startDate     DateTime?
+  endDate       DateTime?
+  budgetAed     Decimal           @default(0) @db.Decimal(14, 2)
+  spentAed      Decimal           @default(0) @db.Decimal(14, 2) // kept in sync from AdSpendEntry
+  ownerId       String?
+  approvedAt    DateTime?
+  createdAt     DateTime          @default(now())
+  updatedAt     DateTime          @updatedAt
+
+  adClient         AdClient?             @relation(fields: [adClientId], references: [id])
+  adContract       AdContract?           @relation(fields: [adContractId], references: [id])
+  owner            User?                 @relation("CampaignOwner", fields: [ownerId], references: [id])
+  channels         CampaignChannel[]
+  brands           CampaignBrand[]
+  products         CampaignProduct[]
+  creatives        AdCreative[]
+  calendarItems    ContentCalendarItem[]
+  socialPosts      SocialPost[]
+  broadcasts       Broadcast[]
+  promotions       Promotion[]
+  landingPages     LandingPage[]
+  utmLinks         UtmLink[]
+  metrics          CampaignMetric[]
+  spendEntries     AdSpendEntry[]
+  influencerDeals  InfluencerDeal[]
+  complianceChecks ComplianceCheck[]
+  leads            Lead[]
+  salesOrders      SalesOrder[]
+  attributions     CampaignAttribution[]
+  expenses         Expense[]
+  slotBookings     AdSlotBooking[]
+  tasks            Task[]
+  reports          ClientReport[]
+
+  @@index([status, ownerType])
+  @@index([adClientId])
+}
+
+model CampaignChannel {
+  id          String  @id @default(cuid())
+  campaignId  String
+  channel     Channel
+  budgetAed   Decimal @default(0) @db.Decimal(14, 2)
+  externalId  String? // campaign id in Meta / Google / TikTok
+  adAccountId String?
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, channel])
+}
+
+model CampaignBrand {
+  campaignId String
+  brandId    String
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  brand    Brand    @relation(fields: [brandId], references: [id])
+
+  @@id([campaignId, brandId])
+}
+
+model CampaignProduct {
+  campaignId String
+  productId  String
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  product  Product  @relation(fields: [productId], references: [id])
+
+  @@id([campaignId, productId])
+}
+
+enum CreativeType {
+  IMAGE
+  VIDEO
+  CAROUSEL
+  STORY
+  REEL
+  BANNER
+  TEXT_ONLY
+}
+
+enum CreativeStatus {
+  DRAFT
+  IN_REVIEW
+  CHANGES_REQUESTED
+  APPROVED
+  LIVE
+  ARCHIVED
+}
+
+model AdCreative {
+  id          String         @id @default(cuid())
+  campaignId  String?
+  adClientId  String? // creative for an agency client
+  title       String
+  type        CreativeType
+  status      CreativeStatus @default(DRAFT)
+  headlineEn  String?
+  headlineAr  String?
+  bodyEn      String?
+  bodyAr      String?
+  ctaEn       String?
+  ctaAr       String?
+  hashtags    String[]
+  tags        String[] // brand / product / season tags
+  aiGenerated Boolean        @default(false)
+  version     Int            @default(1)
+  parentId    String? // previous version
+  createdById String
+  createdAt   DateTime       @default(now())
+  updatedAt   DateTime       @updatedAt
+
+  campaign     Campaign?          @relation(fields: [campaignId], references: [id])
+  adClient     AdClient?          @relation(fields: [adClientId], references: [id])
+  createdBy    User               @relation("CreativeCreatedBy", fields: [createdById], references: [id])
+  parent       AdCreative?        @relation("CreativeVersions", fields: [parentId], references: [id])
+  versions     AdCreative[]       @relation("CreativeVersions")
+  assets       CreativeAsset[]
+  approvals    CreativeApproval[]
+  socialPosts  SocialPost[]
+  slotBookings AdSlotBooking[]
+
+  @@index([campaignId, status])
+}
+
+model CreativeAsset {
+  id          String @id @default(cuid())
+  creativeId  String
+  url         String
+  mimeType    String
+  width       Int?
+  height      Int?
+  durationSec Int?
+  sortOrder   Int    @default(0)
+
+  creative AdCreative @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+}
+
+enum CreativeDecision {
+  APPROVED
+  CHANGES_REQUESTED
+  REJECTED
+  COMMENT
+}
+
+// Approvals and comments by the Manager (internal) or the ad client (portal)
+model CreativeApproval {
+  id         String           @id @default(cuid())
+  creativeId String
+  userId     String
+  isClient   Boolean          @default(false)
+  decision   CreativeDecision
+  comment    String?
+  createdAt  DateTime         @default(now())
+
+  creative AdCreative @relation(fields: [creativeId], references: [id], onDelete: Cascade)
+  user     User       @relation(fields: [userId], references: [id])
+}
+
+// Prompts/outputs of the AI copywriter, kept for re-use and audit
+model AiContentGeneration {
+  id        String   @id @default(cuid())
+  userId    String?
+  productId String?
+  tone      String // LUXURY, RAMADAN_EID, NATIONAL_DAY, VALENTINES, DSF, WHITE_FRIDAY
+  channel   Channel?
+  language  Locale
+  prompt    String
+  output    String
+  model     String?
+  createdAt DateTime @default(now())
+}
+
+// UAE seasons and events, pre-loaded (Ramadan, Eid, National Day 2 Dec, DSF...)
+model MarketingSeason {
+  id        String   @id @default(cuid())
+  key       String // RAMADAN, EID_AL_FITR, EID_AL_ADHA, NATIONAL_DAY, DSF, MOTHERS_DAY, WHITE_FRIDAY, VALENTINES, BACK_TO_SCHOOL
+  nameEn    String
+  nameAr    String?
+  startDate DateTime @db.Date
+  endDate   DateTime @db.Date
+  year      Int
+
+  @@unique([key, year])
+}
+
+enum CalendarItemStatus {
+  IDEA
+  PLANNED
+  IN_PRODUCTION
+  SCHEDULED
+  PUBLISHED
+  CANCELLED
+}
+
+model ContentCalendarItem {
+  id          String             @id @default(cuid())
+  campaignId  String?
+  title       String
+  channel     Channel
+  status      CalendarItemStatus @default(PLANNED)
+  scheduledAt DateTime
+  notes       String?
+  assigneeId  String?
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  campaign   Campaign?   @relation(fields: [campaignId], references: [id])
+  socialPost SocialPost?
+
+  @@index([scheduledAt])
+}
+
+// Connected social / ad accounts (tokens stored encrypted)
+model SocialAccount {
+  id             String    @id @default(cuid())
+  channel        Channel
+  name           String // "@luxora.perfumes"
+  externalId     String
+  adClientId     String? // client's own account (agency)
+  accessTokenEnc String?
+  tokenExpiresAt DateTime?
+  isActive       Boolean   @default(true)
+  createdAt      DateTime  @default(now())
+
+  adClient AdClient?    @relation(fields: [adClientId], references: [id])
+  posts    SocialPost[]
+
+  @@unique([channel, externalId])
+}
+
+enum SocialPostStatus {
+  DRAFT
+  SCHEDULED
+  PUBLISHING
+  PUBLISHED
+  FAILED
+  CANCELLED
+}
+
+model SocialPost {
+  id              String           @id @default(cuid())
+  socialAccountId String
+  campaignId      String?
+  creativeId      String?
+  calendarItemId  String?          @unique
+  caption         String
+  scheduledAt     DateTime
+  status          SocialPostStatus @default(DRAFT)
+  externalPostId  String?
+  publishedAt     DateTime?
+  error           String?
+  createdAt       DateTime         @default(now())
+
+  socialAccount SocialAccount        @relation(fields: [socialAccountId], references: [id])
+  campaign      Campaign?            @relation(fields: [campaignId], references: [id])
+  creative      AdCreative?          @relation(fields: [creativeId], references: [id])
+  calendarItem  ContentCalendarItem? @relation(fields: [calendarItemId], references: [id])
+
+  @@index([status, scheduledAt])
+}
+
+// Saved audience: rules like { "customerType": "SALON", "emirate": "Dubai" }
+model MarketingSegment {
+  id          String   @id @default(cuid())
+  name        String // "Salons in Dubai", "Online sellers who bought Initio"
+  description String?
+  rules       Json
+  isDynamic   Boolean  @default(true) // re-evaluated before each send
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  members    SegmentMember[]
+  broadcasts Broadcast[]
+}
+
+model SegmentMember {
+  id               String  @id @default(cuid())
+  segmentId        String
+  customerId       String?
+  retailCustomerId String?
+
+  segment        MarketingSegment @relation(fields: [segmentId], references: [id], onDelete: Cascade)
+  customer       Customer?        @relation(fields: [customerId], references: [id], onDelete: Cascade)
+  retailCustomer RetailCustomer?  @relation(fields: [retailCustomerId], references: [id], onDelete: Cascade)
+
+  @@index([segmentId])
+}
+
+model MessageTemplate {
+  id             String   @id @default(cuid())
+  channel        Channel // EMAIL, WHATSAPP, SMS
+  name           String
+  locale         Locale
+  subject        String?
+  body           String // supports {{customerName}}, {{brand}}, {{couponCode}}...
+  waTemplateName String? // approved WhatsApp Business template name
+  createdAt      DateTime @default(now())
+  updatedAt      DateTime @updatedAt
+
+  broadcasts Broadcast[]
+}
+
+enum BroadcastStatus {
+  DRAFT
+  SCHEDULED
+  SENDING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+model Broadcast {
+  id          String          @id @default(cuid())
+  name        String
+  channel     Channel
+  campaignId  String?
+  segmentId   String
+  templateId  String
+  status      BroadcastStatus @default(DRAFT)
+  scheduledAt DateTime?
+  sentAt      DateTime?
+  createdById String
+  createdAt   DateTime        @default(now())
+
+  campaign   Campaign?            @relation(fields: [campaignId], references: [id])
+  segment    MarketingSegment     @relation(fields: [segmentId], references: [id])
+  template   MessageTemplate      @relation(fields: [templateId], references: [id])
+  createdBy  User                 @relation(fields: [createdById], references: [id])
+  recipients BroadcastRecipient[]
+}
+
+enum DeliveryStatus {
+  QUEUED
+  SENT
+  DELIVERED
+  OPENED
+  CLICKED
+  BOUNCED
+  FAILED
+  UNSUBSCRIBED
+}
+
+model BroadcastRecipient {
+  id          String         @id @default(cuid())
+  broadcastId String
+  address     String // email or phone
+  name        String?
+  status      DeliveryStatus @default(QUEUED)
+  sentAt      DateTime?
+  openedAt    DateTime?
+  clickedAt   DateTime?
+  error       String?
+
+  broadcast Broadcast @relation(fields: [broadcastId], references: [id], onDelete: Cascade)
+
+  @@index([broadcastId, status])
+}
+
+// Global opt-out list: checked before every email / WhatsApp / SMS send
+model MarketingOptOut {
+  id        String   @id @default(cuid())
+  channel   Channel
+  address   String
+  reason    String?
+  createdAt DateTime @default(now())
+
+  @@unique([channel, address])
+}
+
+enum PromotionType {
+  PERCENT_OFF
+  AMOUNT_OFF
+  BUNDLE
+  BUY_X_GET_Y // e.g. buy 6 get 1 tester
+  VOLUME_DISCOUNT // wholesale
+  FLASH_SALE
+  FREE_SHIPPING
+}
+
+model Promotion {
+  id          String        @id @default(cuid())
+  name        String
+  type        PromotionType
+  campaignId  String?
+  appliesTo   Audience      @default(RETAIL)
+  value       Decimal?      @db.Decimal(14, 2) // % or AED depending on type
+  minOrderAed Decimal?      @db.Decimal(14, 2)
+  minQty      Int?
+  rules       Json? // details for bundles / buy X get Y
+  startsAt    DateTime
+  endsAt      DateTime
+  isActive    Boolean       @default(true)
+  createdAt   DateTime      @default(now())
+
+  campaign Campaign?       @relation(fields: [campaignId], references: [id])
+  items    PromotionItem[]
+  coupons  Coupon[]
+}
+
+model PromotionItem {
+  id          String  @id @default(cuid())
+  promotionId String
+  variantId   String
+  isReward    Boolean @default(false) // the "get" item in buy X get Y
+
+  promotion Promotion      @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  variant   ProductVariant @relation(fields: [variantId], references: [id])
+}
+
+model Coupon {
+  id                 String   @id @default(cuid())
+  code               String   @unique // NATIONALDAY55, EID20...
+  promotionId        String
+  maxUses            Int?
+  maxUsesPerCustomer Int?     @default(1)
+  usedCount          Int      @default(0)
+  influencerId       String? // influencer-specific codes for tracking
+  createdAt          DateTime @default(now())
+
+  promotion  Promotion    @relation(fields: [promotionId], references: [id], onDelete: Cascade)
+  influencer Influencer?  @relation(fields: [influencerId], references: [id])
+  orders     SalesOrder[]
+}
+
+enum LandingPageStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+// Drag-and-drop landing page: content is a list of blocks (hero, products, form...)
+model LandingPage {
+  id          String            @id @default(cuid())
+  slug        String            @unique // luxora.ae/lp/[slug]
+  title       String
+  locale      Locale            @default(EN)
+  campaignId  String?
+  status      LandingPageStatus @default(DRAFT)
+  blocks      Json
+  formFields  Json? // [{ key: "businessName", required: true }, { key: "tradeLicence" }, ...]
+  thankYouMsg String?
+  views       Int               @default(0)
+  createdById String
+  publishedAt DateTime?
+  createdAt   DateTime          @default(now())
+  updatedAt   DateTime          @updatedAt
+
+  campaign    Campaign?               @relation(fields: [campaignId], references: [id])
+  createdBy   User                    @relation(fields: [createdById], references: [id])
+  submissions LandingPageSubmission[]
+  leads       Lead[]
+}
+
+model LandingPageSubmission {
+  id            String   @id @default(cuid())
+  landingPageId String
+  data          Json
+  utmSource     String?
+  utmMedium     String?
+  utmCampaign   String?
+  ipAddress     String?
+  leadId        String? // CRM lead created from this submission
+  createdAt     DateTime @default(now())
+
+  landingPage LandingPage @relation(fields: [landingPageId], references: [id], onDelete: Cascade)
+}
+
+model UtmLink {
+  id          String   @id @default(cuid())
+  campaignId  String
+  destination String // full URL
+  source      String // instagram, facebook, tiktok, whatsapp, newsletter
+  medium      String // paid_social, cpc, email, influencer, broadcast
+  utmCampaign String
+  content     String?
+  term        String?
+  shortCode   String?  @unique // luxora.ae/go/abc123
+  clicks      Int      @default(0)
+  createdAt   DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+}
+
+// Pixel / analytics IDs installed on the storefront and landing pages
+model TrackingPixel {
+  id         String   @id @default(cuid())
+  provider   String // META_PIXEL, GA4, TIKTOK_PIXEL, SNAP_PIXEL, GOOGLE_ADS
+  pixelId    String
+  adClientId String? // for client landing pages
+  isActive   Boolean  @default(true)
+  createdAt  DateTime @default(now())
+
+  @@unique([provider, pixelId])
+}
+
+enum AttributionKind {
+  LEAD
+  ORDER
+  B2B_SIGNUP
+}
+
+// Which campaign gets credit for a lead / order / sign-up
+model CampaignAttribution {
+  id         String          @id @default(cuid())
+  campaignId String
+  kind       AttributionKind
+  refId      String // lead id / sales order id / customer id
+  customerId String?
+  revenueAed Decimal         @default(0) @db.Decimal(14, 2)
+  touchpoint String? // last_click, coupon, utm, influencer_code
+  createdAt  DateTime        @default(now())
+
+  campaign Campaign  @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  customer Customer? @relation(fields: [customerId], references: [id])
+
+  @@index([campaignId, kind])
+}
+
+// Daily performance numbers per campaign + channel (CSV import or API sync)
+model CampaignMetric {
+  id          String   @id @default(cuid())
+  campaignId  String
+  channel     Channel
+  date        DateTime @db.Date
+  impressions Int      @default(0)
+  reach       Int      @default(0)
+  clicks      Int      @default(0)
+  engagements Int      @default(0)
+  videoViews  Int      @default(0)
+  leads       Int      @default(0)
+  conversions Int      @default(0)
+  spendAed    Decimal  @default(0) @db.Decimal(14, 2)
+  revenueAed  Decimal  @default(0) @db.Decimal(14, 2)
+  source      String   @default("MANUAL") // MANUAL, CSV, META_API, GOOGLE_API, TIKTOK_API
+  createdAt   DateTime @default(now())
+
+  campaign Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+
+  @@unique([campaignId, channel, date])
+}
+
+// =============================================================================
+// 11. INFLUENCERS
+// =============================================================================
+
+model Influencer {
+  id                String    @id @default(cuid())
+  name              String
+  email             String?
+  phone             String?
+  whatsapp          String?
+  nationality       String?
+  // UAE Media Council advertiser permit, required for paid promotion in the UAE
+  mediaPermitNo     String?
+  mediaPermitExpiry DateTime? @db.Date
+  categories        String[] // fragrance, beauty, lifestyle, luxury...
+  ratesNote         String?
+  notes             String?
+  isActive          Boolean   @default(true)
+  createdAt         DateTime  @default(now())
+  updatedAt         DateTime  @updatedAt
+
+  profiles  InfluencerProfile[]
+  deals     InfluencerDeal[]
+  coupons   Coupon[]
+  payments  Payment[]
+  documents Document[]
+  gifts     InfluencerGift[]
+}
+
+model InfluencerProfile {
+  id             String   @id @default(cuid())
+  influencerId   String
+  channel        Channel
+  handle         String
+  url            String?
+  followers      Int      @default(0)
+  engagementRate Decimal? @db.Decimal(5, 2) // %
+  updatedAt      DateTime @updatedAt
+
+  influencer Influencer @relation(fields: [influencerId], references: [id], onDelete: Cascade)
+
+  @@unique([channel, handle])
+}
+
+enum InfluencerDealStatus {
+  PROPOSED
+  PENDING_APPROVAL // INFLUENCER_DEAL approval
+  CONFIRMED
+  CONTENT_SUBMITTED
+  PUBLISHED
+  PAID
+  CANCELLED
+}
+
+model InfluencerDeal {
+  id              String               @id @default(cuid())
+  influencerId    String
+  campaignId      String?
+  status          InfluencerDealStatus @default(PROPOSED)
+  deliverables    Json // [{ channel: "INSTAGRAM", type: "REEL", qty: 1, dueDate: "..." }]
+  feeAed          Decimal              @default(0) @db.Decimal(14, 2)
+  productValueAed Decimal              @default(0) @db.Decimal(14, 2) // gifted product value
+  postUrls        String[]
+  impressions     Int                  @default(0)
+  clicks          Int                  @default(0)
+  conversions     Int                  @default(0)
+  revenueAed      Decimal              @default(0) @db.Decimal(14, 2)
+  createdAt       DateTime             @default(now())
+  updatedAt       DateTime             @updatedAt
+
+  influencer Influencer       @relation(fields: [influencerId], references: [id])
+  campaign   Campaign?        @relation(fields: [campaignId], references: [id])
+  gifts      InfluencerGift[]
+}
+
+// Products gifted to influencers (also creates an INFLUENCER_GIFT stock movement)
+model InfluencerGift {
+  id           String   @id @default(cuid())
+  influencerId String
+  dealId       String?
+  variantId    String
+  quantity     Int
+  costAed      Decimal  @db.Decimal(14, 2)
+  sentOn       DateTime @default(now())
+
+  influencer Influencer      @relation(fields: [influencerId], references: [id])
+  deal       InfluencerDeal? @relation(fields: [dealId], references: [id])
+  variant    ProductVariant  @relation(fields: [variantId], references: [id])
+}
+
+// =============================================================================
+// 12. ADVERTISING 8B: agency services for outside clients
+// =============================================================================
+
+enum AdClientStatus {
+  PROSPECT
+  ACTIVE
+  PAUSED
+  ENDED
+}
+
+model AdClient {
+  id               String         @id @default(cuid())
+  code             String         @unique // AGC-0001
+  companyName      String
+  industry         String? // salon, retailer, online seller, restaurant...
+  tradeLicenceNo   String?
+  trn              String?
+  contactName      String?
+  email            String?
+  phone            String?
+  whatsapp         String?
+  address          String?
+  status           AdClientStatus @default(PROSPECT)
+  accountManagerId String?
+  notes            String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  portalUsers    User[]           @relation("AdClientPortalUsers")
+  contracts      AdContract[]
+  proposals      AgencyProposal[]
+  campaigns      Campaign[]
+  creatives      AdCreative[]
+  invoices       Invoice[]
+  payments       Payment[]
+  mediaBudgets   MediaBudget[]
+  slotBookings   AdSlotBooking[]
+  socialAccounts SocialAccount[]
+  documents      Document[]
+  tasks          Task[]
+  timeEntries    TimeEntry[]
+  reports        ClientReport[]
+}
+
+enum BillingModel {
+  MONTHLY_RETAINER
+  PER_CAMPAIGN
+  PER_DELIVERABLE
+  PERCENT_OF_SPEND
+}
+
+model ServicePackage {
+  id             String       @id @default(cuid())
+  key            String       @unique // SMM_BASIC, SMM_PRO, PAID_ADS_MGMT, CONTENT_CREATION, INFLUENCER_CAMPAIGN, BANNER_PLACEMENT
+  nameEn         String
+  nameAr         String?
+  descriptionEn  String?
+  descriptionAr  String?
+  billingModel   BillingModel
+  priceAed       Decimal      @db.Decimal(14, 2)
+  percentOfSpend Decimal?     @db.Decimal(5, 2) // for PERCENT_OF_SPEND
+  inclusions     Json? // { posts: 12, reels: 4, stories: 20, adCampaigns: 1, reports: 1 }
+  isActive       Boolean      @default(true)
+  createdAt      DateTime     @default(now())
+  updatedAt      DateTime     @updatedAt
+
+  contractItems AdContractItem[]
+  proposalItems AgencyProposalItem[]
+}
+
+enum ProposalStatus {
+  DRAFT
+  PENDING_APPROVAL // AGENCY_PROPOSAL (internal, Manager)
+  SENT
+  ACCEPTED
+  REJECTED
+  EXPIRED
+}
+
+// Workflow: brief -> proposal -> client acceptance -> contract
+model AgencyProposal {
+  id             String         @id @default(cuid())
+  number         String         @unique // LUX-PRP-2026-0001
+  adClientId     String
+  status         ProposalStatus @default(DRAFT)
+  brief          String // client's brief
+  objectives     String?
+  validUntil     DateTime?
+  subtotal       Decimal        @default(0) @db.Decimal(14, 2)
+  vatAmount      Decimal        @default(0) @db.Decimal(14, 2)
+  total          Decimal        @default(0) @db.Decimal(14, 2)
+  mediaBudgetAed Decimal        @default(0) @db.Decimal(14, 2) // client ad spend, separate from fees
+  acceptedAt     DateTime?
+  pdfUrl         String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  adClient AdClient             @relation(fields: [adClientId], references: [id])
+  items    AgencyProposalItem[]
+  contract AdContract?
+}
+
+model AgencyProposalItem {
+  id          String  @id @default(cuid())
+  proposalId  String
+  packageId   String?
+  description String
+  quantity    Decimal @db.Decimal(10, 2)
+  unitPrice   Decimal @db.Decimal(14, 2)
+  lineTotal   Decimal @db.Decimal(14, 2)
+
+  proposal AgencyProposal  @relation(fields: [proposalId], references: [id], onDelete: Cascade)
+  package  ServicePackage? @relation(fields: [packageId], references: [id])
+}
+
+enum ContractStatus {
+  DRAFT
+  ACTIVE
+  SUSPENDED
+  COMPLETED
+  TERMINATED
+}
+
+model AdContract {
+  id               String         @id @default(cuid())
+  number           String         @unique // LUX-AGC-2026-0001
+  adClientId       String
+  proposalId       String?        @unique
+  status           ContractStatus @default(DRAFT)
+  billingModel     BillingModel
+  startDate        DateTime       @db.Date
+  endDate          DateTime?      @db.Date
+  monthlyFeeAed    Decimal?       @db.Decimal(14, 2)
+  billingDay       Int?           @default(1) // day of month to raise retainer invoice
+  autoRenew        Boolean        @default(false)
+  terms            String?
+  signedByClientAt DateTime?
+  signedByLuxoraAt DateTime? // Manager signature
+  pdfUrl           String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+
+  adClient     AdClient         @relation(fields: [adClientId], references: [id])
+  proposal     AgencyProposal?  @relation(fields: [proposalId], references: [id])
+  items        AdContractItem[]
+  campaigns    Campaign[]
+  invoices     Invoice[]
+  mediaBudgets MediaBudget[]
+}
+
+model AdContractItem {
+  id          String  @id @default(cuid())
+  contractId  String
+  packageId   String?
+  description String
+  quantity    Decimal @db.Decimal(10, 2)
+  unitPrice   Decimal @db.Decimal(14, 2)
+
+  contract AdContract      @relation(fields: [contractId], references: [id], onDelete: Cascade)
+  package  ServicePackage? @relation(fields: [packageId], references: [id])
+}
+
+// Client's ad-spend money, held separately from agency fees
+model MediaBudget {
+  id                 String   @id @default(cuid())
+  adClientId         String
+  contractId         String?
+  name               String // "Q4 2026 Meta budget"
+  currencyCode       String   @default("AED")
+  toppedUpAed        Decimal  @default(0) @db.Decimal(14, 2) // sum of top-ups
+  spentAed           Decimal  @default(0) @db.Decimal(14, 2) // sum of spend entries
+  lowBalanceAlertAed Decimal  @default(500) @db.Decimal(14, 2)
+  isApproved         Boolean  @default(false) // MEDIA_BUDGET approval
+  isActive           Boolean  @default(true)
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  adClient AdClient           @relation(fields: [adClientId], references: [id])
+  contract AdContract?        @relation(fields: [contractId], references: [id])
+  topUps   MediaBudgetTopUp[]
+  spends   AdSpendEntry[]
+}
+
+model MediaBudgetTopUp {
+  id            String   @id @default(cuid())
+  mediaBudgetId String
+  amountAed     Decimal  @db.Decimal(14, 2)
+  paymentId     String? // the client payment that funded it
+  note          String?
+  createdAt     DateTime @default(now())
+
+  mediaBudget MediaBudget @relation(fields: [mediaBudgetId], references: [id], onDelete: Cascade)
+}
+
+// Every unit of ad spend: in-house (campaign only) or agency (campaign + media budget)
+model AdSpendEntry {
+  id            String   @id @default(cuid())
+  campaignId    String
+  mediaBudgetId String?
+  channel       Channel
+  date          DateTime @db.Date
+  amountAed     Decimal  @db.Decimal(14, 2)
+  source        String   @default("MANUAL") // MANUAL, CSV, META_API, GOOGLE_API, TIKTOK_API
+  reference     String? // platform invoice / receipt
+  isRecharged   Boolean  @default(false) // billed back to the client
+  createdAt     DateTime @default(now())
+
+  campaign    Campaign     @relation(fields: [campaignId], references: [id])
+  mediaBudget MediaBudget? @relation(fields: [mediaBudgetId], references: [id])
+
+  @@index([campaignId, date])
+}
+
+enum AdSlotType {
+  STOREFRONT_HERO_BANNER
+  STOREFRONT_CATEGORY_BANNER
+  STOREFRONT_SIDEBAR
+  NEWSLETTER_SPONSOR
+  WHATSAPP_BROADCAST
+  B2B_PORTAL_BANNER
+}
+
+enum SlotPricing {
+  PER_DAY
+  PER_WEEK
+  PER_SEND
+  PER_1000_IMPRESSIONS
+}
+
+// LUXORA's own media space that can be sold to clients
+model AdSlot {
+  id            String      @id @default(cuid())
+  type          AdSlotType
+  name          String
+  placement     String // e.g. "home.hero", "brand.sidebar"
+  widthPx       Int?
+  heightPx      Int?
+  pricing       SlotPricing
+  priceAed      Decimal     @db.Decimal(14, 2)
+  maxConcurrent Int         @default(1) // bookings allowed at the same time
+  isActive      Boolean     @default(true)
+  createdAt     DateTime    @default(now())
+
+  bookings AdSlotBooking[]
+}
+
+enum BookingStatus {
+  HELD
+  CONFIRMED
+  LIVE
+  COMPLETED
+  CANCELLED
+}
+
+// Overlap is checked in the service layer (date range + maxConcurrent)
+model AdSlotBooking {
+  id          String        @id @default(cuid())
+  slotId      String
+  adClientId  String?
+  campaignId  String?
+  creativeId  String?
+  status      BookingStatus @default(HELD)
+  startsAt    DateTime
+  endsAt      DateTime
+  priceAed    Decimal       @db.Decimal(14, 2)
+  impressions Int           @default(0)
+  clicks      Int           @default(0)
+  targetUrl   String?
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  slot     AdSlot      @relation(fields: [slotId], references: [id])
+  adClient AdClient?   @relation(fields: [adClientId], references: [id])
+  campaign Campaign?   @relation(fields: [campaignId], references: [id])
+  creative AdCreative? @relation(fields: [creativeId], references: [id])
+
+  @@index([slotId, startsAt, endsAt])
+}
+
+enum ReportStatus {
+  GENERATING
+  READY
+  SENT
+  FAILED
+}
+
+// Branded monthly PDF performance report for a client (or in-house)
+model ClientReport {
+  id              String       @id @default(cuid())
+  adClientId      String?
+  campaignId      String?
+  period          String // "2026-10"
+  status          ReportStatus @default(GENERATING)
+  summary         Json? // KPIs snapshot
+  recommendations String?
+  pdfUrl          String?
+  sentAt          DateTime?
+  createdAt       DateTime     @default(now())
+
+  adClient AdClient? @relation(fields: [adClientId], references: [id])
+  campaign Campaign? @relation(fields: [campaignId], references: [id])
+
+  @@index([adClientId, period])
+}
+
+enum TaskStatus {
+  TODO
+  IN_PROGRESS
+  IN_REVIEW
+  DONE
+  CANCELLED
+}
+
+enum TaskPriority {
+  LOW
+  MEDIUM
+  HIGH
+  URGENT
+}
+
+// Team tasks for designers / marketers (agency work and in-house)
+model Task {
+  id          String       @id @default(cuid())
+  title       String
+  description String?
+  status      TaskStatus   @default(TODO)
+  priority    TaskPriority @default(MEDIUM)
+  dueAt       DateTime?
+  assigneeId  String?
+  creatorId   String
+  adClientId  String?
+  campaignId  String?
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+
+  assignee    User?       @relation("TaskAssignee", fields: [assigneeId], references: [id])
+  creator     User        @relation("TaskCreator", fields: [creatorId], references: [id])
+  adClient    AdClient?   @relation(fields: [adClientId], references: [id])
+  campaign    Campaign?   @relation(fields: [campaignId], references: [id])
+  timeEntries TimeEntry[]
+
+  @@index([assigneeId, status])
+}
+
+// Time spent per client, for agency profitability
+model TimeEntry {
+  id            String   @id @default(cuid())
+  userId        String
+  taskId        String?
+  adClientId    String?
+  minutes       Int
+  hourlyCostAed Decimal  @db.Decimal(10, 2) // internal cost rate
+  note          String?
+  date          DateTime @db.Date
+  createdAt     DateTime @default(now())
+
+  user     User      @relation(fields: [userId], references: [id])
+  task     Task?     @relation(fields: [taskId], references: [id])
+  adClient AdClient? @relation(fields: [adClientId], references: [id])
+
+  @@index([adClientId, date])
+}
+
+// =============================================================================
+// 13. ADVERTISING 8C: compliance
+// =============================================================================
+
+enum ComplianceResult {
+  PENDING
+  PASSED
+  FAILED
+}
+
+// Checklist run before a campaign can be sent for Manager approval
+model ComplianceCheck {
+  id                    String           @id @default(cuid())
+  campaignId            String
+  result                ComplianceResult @default(PENDING)
+  brandPermissionOk     Boolean          @default(false) // logo / trademark use permitted
+  authenticityProofOk   Boolean          @default(false) // "original" claims backed by batch documents
+  pricingNotMisleading  Boolean          @default(false)
+  arabicCopyReviewed    Boolean          @default(false)
+  influencerPermitsOk   Boolean          @default(false) // all influencers have a valid Media Council permit
+  companyMediaLicenceOk Boolean          @default(false)
+  notes                 String?
+  checkedById           String
+  checkedAt             DateTime         @default(now())
+
+  campaign  Campaign @relation(fields: [campaignId], references: [id], onDelete: Cascade)
+  checkedBy User     @relation(fields: [checkedById], references: [id])
+
+  @@index([campaignId])
+}
