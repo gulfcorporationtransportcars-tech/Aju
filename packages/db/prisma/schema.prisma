@@ -278,12 +278,12 @@ model Setting {
 
 // Document number sequences: LUX-INV-2026-0001, LUX-QT-2026-0001...
 model NumberSequence {
-  id      String @id @default(cuid())
-  docType String // INV, QT, SO, DN, PO, GRN, CN, PAY, EXP, JE, CMP, AGC...
-  year    Int
-  prefix  String @default("LUX")
-  next    Int    @default(1)
-  padding Int    @default(4)
+  id         String @id @default(cuid())
+  docType    String // INV, QT, SO, DN, PO, GRN, CN, PAY, EXP, JE, CMP, AGC...
+  year       Int
+  prefix     String @default("LUX")
+  lastNumber Int    @default(0) // last number issued; incremented atomically
+  padding    Int    @default(4)
 
   @@unique([docType, year])
 }

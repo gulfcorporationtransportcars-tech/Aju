@@ -387,7 +387,7 @@ CREATE TABLE "NumberSequence" (
     "docType" TEXT NOT NULL,
     "year" INTEGER NOT NULL,
     "prefix" TEXT NOT NULL DEFAULT 'LUX',
-    "next" INTEGER NOT NULL DEFAULT 1,
+    "lastNumber" INTEGER NOT NULL DEFAULT 0,
     "padding" INTEGER NOT NULL DEFAULT 4,
 
     CONSTRAINT "NumberSequence_pkey" PRIMARY KEY ("id")
