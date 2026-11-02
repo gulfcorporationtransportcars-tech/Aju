@@ -1,0 +1,15 @@
+{
+  "name": "luxora-hub",
+  "private": true,
+  "packageManager": "pnpm@10.28.0",
+  "scripts": {
+    "build": "pnpm --filter @luxora/shared build && pnpm --filter @luxora/db generate && pnpm --filter @luxora/db build && pnpm --filter @luxora/api build",
+    "test": "pnpm --filter @luxora/shared test && pnpm --filter @luxora/api test",
+    "typecheck": "pnpm --filter @luxora/shared typecheck && pnpm --filter @luxora/api typecheck",
+    "dev:api": "pnpm --filter @luxora/api dev",
+    "db:validate": "pnpm --filter @luxora/db validate",
+    "db:generate": "pnpm --filter @luxora/db generate",
+    "db:migrate": "pnpm --filter @luxora/db migrate",
+    "db:seed": "pnpm --filter @luxora/db seed"
+  }
+}

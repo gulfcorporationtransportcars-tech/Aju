@@ -1,0 +1,27 @@
+{
+  "name": "@luxora/db",
+  "version": "0.1.0",
+  "private": true,
+  "main": "dist/index.js",
+  "scripts": {
+    "validate": "prisma validate",
+    "format": "prisma format",
+    "generate": "prisma generate",
+    "migrate": "prisma migrate dev",
+    "deploy": "prisma migrate deploy",
+    "studio": "prisma studio",
+    "build": "tsc -p tsconfig.json",
+    "seed": "node dist/seed-core.js"
+  },
+  "dependencies": {
+    "@prisma/client": "6.19.3",
+    "@luxora/shared": "workspace:*",
+    "argon2": "0.41.1"
+  },
+  "devDependencies": {
+    "prisma": "6.19.3",
+    "typescript": "5.9.3",
+    "@types/node": "22.20.5"
+  },
+  "types": "dist/index.d.ts"
+}
