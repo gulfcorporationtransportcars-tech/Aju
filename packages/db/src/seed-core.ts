@@ -79,6 +79,53 @@ const COUNTRIES = [
   { code: "IN", nameEn: "India", nameAr: "الهند", isGcc: false },
 ];
 
+/**
+ * Chart of accounts. "system" accounts are used by automatic postings and cannot be
+ * deleted. Codes are referenced in apps/api/src/finance/ledger/accounts.ts.
+ */
+export const CHART_OF_ACCOUNTS: { code: string; name: string; type: "ASSET" | "LIABILITY" | "EQUITY" | "INCOME" | "EXPENSE" }[] = [
+  // Assets
+  { code: "1000", name: "Cash on hand", type: "ASSET" },
+  { code: "1010", name: "Bank: main AED account", type: "ASSET" },
+  { code: "1050", name: "Cheques in hand (PDC receivable)", type: "ASSET" },
+  { code: "1100", name: "Accounts receivable", type: "ASSET" },
+  { code: "1200", name: "Inventory", type: "ASSET" },
+  { code: "1300", name: "VAT input (recoverable)", type: "ASSET" },
+  { code: "1400", name: "Prepayments & deposits", type: "ASSET" },
+  // Liabilities
+  { code: "2000", name: "Accounts payable", type: "LIABILITY" },
+  { code: "2050", name: "Goods received not invoiced", type: "LIABILITY" },
+  { code: "2100", name: "VAT output payable", type: "LIABILITY" },
+  { code: "2150", name: "Client media funds held", type: "LIABILITY" },
+  { code: "2200", name: "Customer advances", type: "LIABILITY" },
+  { code: "2300", name: "Salaries & commissions payable", type: "LIABILITY" },
+  // Equity
+  { code: "3000", name: "Share capital", type: "EQUITY" },
+  { code: "3100", name: "Retained earnings", type: "EQUITY" },
+  { code: "3900", name: "Opening balance equity", type: "EQUITY" },
+  // Income
+  { code: "4000", name: "Sales: wholesale & B2B", type: "INCOME" },
+  { code: "4010", name: "Sales: online store", type: "INCOME" },
+  { code: "4020", name: "Sales: export", type: "INCOME" },
+  { code: "4100", name: "Advertising agency services", type: "INCOME" },
+  { code: "4200", name: "Ad space income", type: "INCOME" },
+  { code: "4900", name: "Sales returns & credit notes", type: "INCOME" },
+  // Cost of sales & expenses
+  { code: "5000", name: "Cost of goods sold", type: "EXPENSE" },
+  { code: "5100", name: "Stock write-offs & damage", type: "EXPENSE" },
+  { code: "5110", name: "Samples & testers", type: "EXPENSE" },
+  { code: "5120", name: "Influencer gifted products", type: "EXPENSE" },
+  { code: "5200", name: "Media spend recharged to clients", type: "EXPENSE" },
+  { code: "6000", name: "Advertising & marketing", type: "EXPENSE" },
+  { code: "6100", name: "Salaries & commissions", type: "EXPENSE" },
+  { code: "6200", name: "Rent, licence & government fees", type: "EXPENSE" },
+  { code: "6300", name: "Bank charges", type: "EXPENSE" },
+  { code: "6400", name: "Courier & delivery", type: "EXPENSE" },
+  { code: "6500", name: "Office & IT", type: "EXPENSE" },
+  { code: "6900", name: "Other expenses", type: "EXPENSE" },
+  { code: "7000", name: "Exchange gains & losses", type: "EXPENSE" },
+];
+
 export interface SeedCoreOptions {
   managerEmail: string;
   managerPassword: string;
@@ -136,6 +183,16 @@ export async function seedCore(prisma: PrismaClient, opts: SeedCoreOptions) {
     where: { code: "IN-TRANSIT" },
     update: {},
     create: { code: "IN-TRANSIT", name: "In Transit", type: "IN_TRANSIT" },
+  });
+
+  for (const a of CHART_OF_ACCOUNTS) {
+    await prisma.account.upsert({ where: { code: a.code }, update: {}, create: { ...a, isSystem: true } });
+  }
+  const bankLedger = await prisma.account.findUniqueOrThrow({ where: { code: "1010" } });
+  await prisma.bankAccount.upsert({
+    where: { accountId: bankLedger.id },
+    update: {},
+    create: { accountId: bankLedger.id, bankName: "Main bank", accountName: COMPANY_PROFILE.legalName, currencyCode: "AED" },
   });
 
   await prisma.setting.upsert({ where: { key: "company.profile" }, update: {}, create: { key: "company.profile", value: COMPANY_PROFILE } });

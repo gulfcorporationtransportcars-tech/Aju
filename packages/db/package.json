@@ -23,8 +23,5 @@
     "typescript": "5.9.3",
     "@types/node": "22.20.5"
   },
-  "types": "dist/index.d.ts",
-  "prisma": {
-    "seed": "node dist/seed-core.js"
-  }
+  "types": "dist/index.d.ts"
 }

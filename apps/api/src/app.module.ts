@@ -16,6 +16,10 @@ import { SettingsModule } from "./core/settings/settings.module";
 import { UsersModule } from "./core/users/users.module";
 import { CatalogueModule } from "./trading/catalogue/catalogue.module";
 import { InventoryModule } from "./trading/inventory/inventory.module";
+import { FinanceModule } from "./finance/finance.module";
+import { LedgerModule } from "./finance/ledger/ledger.service";
+import { PurchasingModule } from "./purchasing/purchasing.module";
+import { SalesModule } from "./sales/sales.module";
 
 @Controller("health")
 class HealthController {
@@ -45,9 +49,13 @@ class HealthController {
     AuthModule,
     UsersModule,
     SettingsModule,
+    LedgerModule,
     // trading
     CatalogueModule,
     InventoryModule,
+    PurchasingModule,
+    SalesModule,
+    FinanceModule,
   ],
   controllers: [HealthController],
   providers: [

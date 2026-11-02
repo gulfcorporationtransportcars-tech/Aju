@@ -11,6 +11,7 @@ import { PrismaService, Tx } from "../../common/prisma/prisma.service";
 import { ApprovalsService } from "../../core/approvals/approvals.service";
 import { AuditService } from "../../core/audit/audit.service";
 import { NumberingService } from "../../core/numbering/numbering.service";
+import { LedgerService } from "../../finance/ledger/ledger.service";
 import { StockService } from "./stock.service";
 
 const WarehouseBody = z.object({
@@ -83,6 +84,7 @@ export class InventoryController implements OnModuleInit {
     private readonly approvals: ApprovalsService,
     private readonly audit: AuditService,
     private readonly numbering: NumberingService,
+    private readonly ledger: LedgerService,
   ) {}
 
   onModuleInit() {
@@ -212,6 +214,7 @@ export class InventoryController implements OnModuleInit {
       for (const line of body.lines) {
         movements.push(await this.stock.receive(tx, { ...line, type: "OPENING", refType: "OpeningStock", reason: "Opening stock", userId: me.id }));
       }
+      await this.ledger.postStockMovements(tx, movements, { source: "OPENING", refType: "OpeningStock", memo: "Opening stock", userId: me.id });
       await this.audit.log({ userId: me.id, action: "CREATE", entityType: "OpeningStock", after: body }, tx);
       return { count: movements.length };
     });
@@ -334,31 +337,35 @@ export class InventoryController implements OnModuleInit {
     const common = { refType: "StockAdjustment", refId: req.entityId, reason: a.reason, userId: deciderId };
     if (a.type === "ADJUSTMENT_PLUS") {
       const batch = await tx.batch.findUniqueOrThrow({ where: { id: a.batchId } });
-      await this.stock.receive(tx, { ...common, variantId: a.variantId, warehouseId: a.warehouseId, batchNo: batch.batchNo, quantity: a.quantity, unitCostAed: a.unitCostAed, type: "ADJUSTMENT_PLUS" });
+      const mv = await this.stock.receive(tx, { ...common, variantId: a.variantId, warehouseId: a.warehouseId, batchNo: batch.batchNo, quantity: a.quantity, unitCostAed: a.unitCostAed, type: "ADJUSTMENT_PLUS" });
+      await this.ledger.postStockMovements(tx, [mv], { source: "STOCK_ADJUSTMENT", refType: "StockAdjustment", refId: req.entityId, memo: a.reason, userId: deciderId });
     } else {
-      await this.stock.issue(tx, {
+      const mvs = await this.stock.issue(tx, {
         ...common,
         variantId: a.variantId,
         picks: [{ batchId: a.batchId, warehouseId: a.warehouseId, quantity: a.quantity }],
         type: a.type,
         fromReserved: false,
       });
+      await this.ledger.postStockMovements(tx, mvs, { source: "STOCK_ADJUSTMENT", refType: "StockAdjustment", refId: req.entityId, memo: a.reason, userId: deciderId });
     }
   }
 
   private async applyStockTake(tx: Tx, stockTakeId: string, deciderId: string) {
     const st = await tx.stockTake.findUniqueOrThrow({ where: { id: stockTakeId }, include: { lines: true } });
+    const movements = [];
     for (const l of st.lines) {
       const diff = (l.countedQty ?? l.systemQty) - l.systemQty;
       if (diff === 0) continue;
       const batch = await tx.batch.findUniqueOrThrow({ where: { variantId_batchNo: { variantId: l.variantId, batchNo: l.batchNo! } } });
       const common = { refType: "StockTake", refId: st.id, reason: `Stock-take ${st.number}`, userId: deciderId };
       if (diff > 0) {
-        await this.stock.receive(tx, { ...common, variantId: l.variantId, warehouseId: st.warehouseId, batchNo: batch.batchNo, quantity: diff, unitCostAed: batch.unitCostAed.toString(), type: "STOCK_TAKE" });
+        movements.push(await this.stock.receive(tx, { ...common, variantId: l.variantId, warehouseId: st.warehouseId, batchNo: batch.batchNo, quantity: diff, unitCostAed: batch.unitCostAed.toString(), type: "STOCK_TAKE" }));
       } else {
-        await this.stock.issue(tx, { ...common, variantId: l.variantId, picks: [{ batchId: batch.id, warehouseId: st.warehouseId, quantity: -diff }], type: "STOCK_TAKE", fromReserved: false });
+        movements.push(...(await this.stock.issue(tx, { ...common, variantId: l.variantId, picks: [{ batchId: batch.id, warehouseId: st.warehouseId, quantity: -diff }], type: "STOCK_TAKE", fromReserved: false })));
       }
     }
+    await this.ledger.postStockMovements(tx, movements, { source: "STOCK_ADJUSTMENT", refType: "StockTake", refId: st.id, memo: `Stock-take ${st.number}`, userId: deciderId });
     await tx.stockTake.update({ where: { id: st.id }, data: { status: "APPROVED", completedAt: new Date() } });
   }
 }

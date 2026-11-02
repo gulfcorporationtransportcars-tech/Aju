@@ -8,5 +8,6 @@ Business management and advertising software for **LUXORA Perfume & Cosmetics Tr
   - `01-architecture.md`: system design and folder structure
   - `02-database.md`: database design (125 tables)
   - `03a-backend-foundation.md`: login, permissions, approvals, catalogue, inventory API
+  - `03b-purchasing-sales-finance.md`: purchasing, sales & CRM, finance & UAE VAT
 
 Quick start: see `docs/03a-backend-foundation.md` → "Running it".
